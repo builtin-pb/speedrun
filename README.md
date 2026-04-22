@@ -48,6 +48,8 @@ The goal is that plain defaults are already reasonable, so most runs should not 
 
 ## CLI Examples
 
+Before running any of the commands below, export `WANDB_API_KEY`.
+
 Use plain composable arguments. Override only what you are testing.
 
 Run with defaults:
@@ -94,6 +96,12 @@ On any machine that will run training, install the Python dependencies first:
 pip install -r requirements.txt
 ```
 
+This trainer now requires W&B online logging. Set `WANDB_API_KEY` before launching runs:
+
+```bash
+export WANDB_API_KEY=...
+```
+
 Keep `data/` intact. If your server already has the dataset downloaded, leave it there.
 
 ## Experiment Tracking
@@ -105,6 +113,12 @@ Keep experiment notes lightweight. Record:
 - any next guess
 
 There is a starter notes stub in [experiments/README.md](experiments/README.md).
+
+Training also logs to W&B by default. The dashboard is organized into:
+- `main/*` for high-signal run health and throughput metrics
+- `stability/*` for sampled logits and softcap diagnostics
+- `layer/*` for lower-cadence block-level activation and norm checks
+- `matrix/*` for lower-cadence per-matrix parameter and gradient norms
 
 ## Repo Direction
 
