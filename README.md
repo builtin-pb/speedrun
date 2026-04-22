@@ -13,6 +13,7 @@ If you want the old speedrun code, records, and historical material, look under 
 
 The active surface of the repo is meant to stay small:
 - `train_gpt_simple.py` is the main trainer
+- `train_logging.py` contains W&B logging and training diagnostics helpers
 - `run_simple.sh` is the server-side entrypoint
 - `sync_to_server.sh` syncs the repo from your Mac to the server
 - `experiments/` is for lightweight experiment notes
@@ -116,9 +117,9 @@ There is a starter notes stub in [experiments/README.md](experiments/README.md).
 
 Training also logs to W&B by default. The dashboard is organized into:
 - `main/*` for high-signal run health and throughput metrics
-- `stability/*` for sampled logits and softcap diagnostics
-- `layer/*` for lower-cadence block-level activation and norm checks
-- `matrix/*` for lower-cadence per-matrix parameter and gradient norms
+- `logits/*` for sampled logits and softcap diagnostics
+- `attn_q/*`, `attn_k/*`, `attn_v/*`, `attn_proj/*`, `mlp_fc/*`, `mlp_proj/*`, `embed/*`, and `lm_head/*` for parameter-type diagnostics
+- `block_00/*`, `block_01/*`, ... and `final/*` for sampled layer-level diagnostics that are not already captured by matrix norms
 
 ## Repo Direction
 
