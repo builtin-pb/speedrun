@@ -7,71 +7,151 @@ In particular, we remove non-standard parameters (e.g., value embeddings) in ord
 See the speedrun repo for a full list of contributors.
 """
 
+from __future__ import annotations
+
+import argparse
 import os
-import sys
-with open(sys.argv[0]) as f:
-    code = f.read() # read the code of this file ASAP, for logging
-import uuid
 import time
+import uuid
 from pathlib import Path
 
-import torch
-from torch import Tensor, nn
-import torch.nn.functional as F
-import torch.distributed as dist
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Train the simplified GPT baseline with explicit, composable flags.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--train-pattern", default="data/fineweb10B/fineweb_train_*.bin")
+    parser.add_argument("--val-pattern", default="data/fineweb10B/fineweb_val_*.bin")
+    parser.add_argument("--batch-size", type=int, default=8 * 64 * 1024, help="Global batch size in tokens across all ranks.")
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--micro-batch-size", type=int, default=64, help="Per-rank microbatch size in sequences.")
+    parser.add_argument("--train-steps", type=int, default=3800)
+    parser.add_argument("--val-interval", type=int, default=125)
+    parser.add_argument("--val-tokens", type=int, default=10_485_760)
+    parser.add_argument("--cooldown-frac", type=float, default=0.7)
+    parser.add_argument("--log-dir", default="logs")
+
+    parser.add_argument("--vocab-size", type=int, default=50304)
+    parser.add_argument("--num-layers", type=int, default=12)
+    parser.add_argument("--model-dim", type=int, default=768)
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--mlp-expansion", type=int, default=4)
+    parser.add_argument("--rope-base", type=float, default=1024.0)
+    parser.add_argument("--attention-scale", type=float, default=0.12)
+    parser.add_argument("--logit-softcap", type=float, default=15.0)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--zero-proj", action=argparse.BooleanOptionalAction, default=True)
+
+    parser.add_argument("--adam-head-lr", type=float, default=1 / 320)
+    parser.add_argument("--adam-embed-lr", type=float, default=0.3)
+    parser.add_argument("--adam-beta1", type=float, default=0.8)
+    parser.add_argument("--adam-beta2", type=float, default=0.95)
+    parser.add_argument("--adam-eps", type=float, default=1e-10)
+    parser.add_argument("--adam-weight-decay", type=float, default=0.0)
+    parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--muon-lr", type=float, default=0.02)
+    parser.add_argument("--muon-weight-decay", type=float, default=0.01)
+    parser.add_argument("--muon-momentum", type=float, default=0.95)
+    return parser
 
 
-########################################
-#                Setup                 #
-########################################
+def read_code_snapshot() -> str:
+    return Path(__file__).read_text()
 
-# torchrun sets these env variables
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-# this code can be run equivalently with 1, 2, 4, or 8 gpus.
-assert 8 % dist.get_world_size() == 0
 
-# logging setup
-if dist.get_rank() == 0:
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{uuid.uuid4()}.txt"
-    print(logfile)
-def print0(s, console=False):
+def validate_args(args: argparse.Namespace) -> None:
+    if args.model_dim % args.head_dim != 0:
+        raise ValueError("--head-dim must divide --model-dim")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.seq_len <= 0:
+        raise ValueError("--seq-len must be positive")
+    if args.micro_batch_size <= 0:
+        raise ValueError("--micro-batch-size must be positive")
+    if args.train_steps <= 0:
+        raise ValueError("--train-steps must be positive")
+    if args.val_interval <= 0:
+        raise ValueError("--val-interval must be positive")
+    if args.val_tokens <= 0:
+        raise ValueError("--val-tokens must be positive")
+    if not 0 < args.cooldown_frac <= 1:
+        raise ValueError("--cooldown-frac must be in (0, 1]")
+
+
+def setup_distributed() -> torch.device:
+    import torch
+    import torch.distributed as dist
+
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None:
+        raise RuntimeError("LOCAL_RANK is not set. Launch training with torchrun.")
+
+    device = torch.device("cuda", int(local_rank))
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    if 8 % dist.get_world_size() != 0:
+        raise RuntimeError("This trainer expects a world size that divides 8.")
+    return device
+
+
+def make_logger(log_dir: str):
+    import torch.distributed as dist
+
+    log_path = None
     if dist.get_rank() == 0:
-        with open(logfile, "a") as f:
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = f"{log_dir}/{uuid.uuid4()}.txt"
+        print(log_path)
+
+    def print0(message: str, console: bool = False) -> None:
+        if dist.get_rank() != 0:
+            return
+        with open(log_path, "a") as handle:
             if console:
-                print(s)
-            print(s, file=f)
+                print(message)
+            print(message, file=handle)
 
-# we begin by logging this file itself
-print0(code)
-print0("="*100)
-print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
-print0("="*100)
+    return print0
 
 
-########################################
-#              Dataloader              #
-########################################
+def log_resolved_config(args: argparse.Namespace, print0) -> None:
+    print0("Resolved config:", console=True)
+    for key, value in sorted(vars(args).items()):
+        print0(f"  {key}={value}", console=True)
 
-def _load_data_shard(file: Path):
-    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+
+def _load_data_shard(file: Path) -> torch.Tensor:
+    import torch
+
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32)
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
-    num_tokens = int(header[2]) # number of tokens (claimed)
-    with file.open("rb", buffering=0) as f:
+    num_tokens = int(header[2])
+    with file.open("rb", buffering=0) as handle:
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
-        f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        handle.seek(256 * 4)
+        nbytes = handle.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
+
+def distributed_data_generator(
+    filename_pattern: str,
+    batch_size: int,
+    *,
+    seq_len: int,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+):
+    import torch
+
     files = sorted(Path.cwd().glob(filename_pattern))
+    if not files:
+        raise FileNotFoundError(f"No data shards matched {filename_pattern!r}")
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
     file_iter = iter(files)
@@ -79,260 +159,179 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1
     while True:
         if pos + batch_size + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
-        buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        buf = tokens[pos + rank * local_batch_size:][: local_batch_size + 1]
+        inputs = buf[:-1].to(device=device, dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device=device, dtype=torch.int64, non_blocking=True)
         pos += batch_size
         yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
 
 
-########################################
-#             Architecture             #
-########################################
-
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
-
-class Linear(nn.Linear):
-    def __init__(self, in_features, out_features):
-        super().__init__(in_features, out_features, bias=False)
-    
-    def forward(self, x):
-        return F.linear(x, self.weight.bfloat16())
-
-class Rotary(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        # half-truncate RoPE (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        self.angular_freq = nn.Buffer(torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
-
-    def forward(self, x_BTHD: Tensor):
-        pos = torch.arange(x_BTHD.size(1), dtype=torch.float, device=x_BTHD.device)
-        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
-        cos, sin = theta.cos(), theta.sin()
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim=128):
-        super().__init__()
-        self.num_heads = dim // head_dim
-        self.head_dim = head_dim
-        hdim = self.num_heads * self.head_dim
-        self.q = Linear(dim, hdim)
-        self.k = Linear(dim, hdim)
-        self.v = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim)
-        self.rotary = Rotary(head_dim)
-
-    def forward(self, x: Tensor):
-        B, T = x.size(0), x.size(1)
-        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
-        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
-        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
-        q, k = norm(q), norm(k)
-        q, k = self.rotary(q), self.rotary(k)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
-                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
-        y = self.proj(y)
-        return y
-
-class MLP(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        hdim = 4 * dim
-        self.fc = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim)
-
-    def forward(self, x: Tensor):
-        x = self.fc(x)
-        x = F.relu(x).square()
-        x = self.proj(x)
-        return x
-
-class Block(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.attn = CausalSelfAttention(dim)
-        self.mlp = MLP(dim)
-
-    def forward(self, x: Tensor):
-        x = x + self.attn(norm(x))
-        x = x + self.mlp(norm(x))
-        return x
-
-class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
-        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
-        self.proj = Linear(model_dim, vocab_size)
-
-    def forward(self, inputs: Tensor, targets: Tensor):
-        x = norm(self.embed(inputs))
-        for block in self.blocks:
-            x = block(x)
-        logits = self.proj(norm(x)).float()
-        logits = 15 * logits * torch.rsqrt(logits.square() + 225)
-        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
-
-
-########################################
-#              Optimizer               #
-########################################
-
-def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
-    assert G.ndim >= 2
-    X = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-
-    # Ensure spectral norm is at most 1
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for a, b, c in [
-        (4.0848, -6.8946, 2.9270),
-        (3.9505, -6.3029, 2.6377),
-        (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046),
-        (2.8366, -3.0525, 1.2012),
-    ]:
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
-@torch.compile
-def muon_update(grad, momentum, beta=0.95, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
-    update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
-    return update
-
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
-        params = sorted(params, key=lambda x: x.size(), reverse=True)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self):
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        for group in self.param_groups:
-            params = group["params"]
-            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
-            for base_i in range(len(params))[::world_size]:
-                if base_i + rank < len(params):
-                    p = params[base_i + rank]
-                    state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
-                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
-
-
-########################################
-#            Initialization            #
-########################################
-
-model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
-model.compile(dynamic=False)
-
-for name, param in model.named_parameters():
-    if name.endswith("weight") and "proj" in name:
-        param.data.zero_()
-    dist.broadcast(param.detach(), 0)
-
-# collect the parameters to optimize
-hidden_matrix_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
-embed_params = [*model.embed.parameters()]
-head_params = [model.proj.weight]
-
-# init the optimizer(s)
-adam_param_groups = [dict(params=head_params, lr=1/320), dict(params=embed_params, lr=0.3)]
-optimizer1 = torch.optim.AdamW(adam_param_groups, betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.02, weight_decay=0.01)
-optimizers = [optimizer1, optimizer2]
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["initial_lr"] = group["lr"]
-
-train_steps = 3800
-
-# learning rate schedule: stable then decay
-def get_lr(step: int, cooldown_frac=0.7):
-    x = step / train_steps # progress in training
-    assert 0 <= x < 1
-    if x < 1 - cooldown_frac:
+def get_lr(step: int, train_steps: int, cooldown_frac: float) -> float:
+    progress = step / train_steps
+    assert 0 <= progress < 1
+    if progress < 1 - cooldown_frac:
         return 1.0
-    else:
-        return (1 - x) / cooldown_frac
+    return (1 - progress) / cooldown_frac
 
 
-########################################
-#        Training and Validation       #
-########################################
+def build_model(args: argparse.Namespace) -> GPT:
+    from simple_model import GPT, GPTConfig
 
-train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size=8*64*1024)
-training_time = 0
-# start the clock
-dist.barrier()
-t0 = time.perf_counter()
-for step in range(train_steps + 1):
-    is_last_step = (step == train_steps)
+    config = GPTConfig(
+        vocab_size=args.vocab_size,
+        num_layers=args.num_layers,
+        model_dim=args.model_dim,
+        head_dim=args.head_dim,
+        mlp_expansion=args.mlp_expansion,
+        rope_base=args.rope_base,
+        attention_scale=args.attention_scale,
+        logit_softcap=args.logit_softcap,
+    )
+    model = GPT(config).cuda()
+    if args.compile:
+        model.compile(dynamic=False)
+    return model
 
-    # --------------- VALIDATION SECTION -----------------
-    if is_last_step or step % 125 == 0:
-        # stop the clock
-        dist.barrier()
-        training_time += time.perf_counter() - t0
-        model.eval()
-        val_tokens = 10485760
-        val_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens)
-        val_loss = 0
-        with torch.no_grad():
-            inputs, targets = next(val_loader)
-            for i in range(len(inputs) // 64):
-                val_loss += model(inputs[64*i:64*i+64], targets[64*i:64*i+64])
-        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
-        val_loss /= val_tokens
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
-               + f" step_avg:{1000*training_time/max(step, 1):.2f}ms", console=True)
-        model.train()
-        # start the clock again
-        dist.barrier()
-        t0 = time.perf_counter()
-        if is_last_step:
-            break
 
-    # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    # accumulate across microbatches in case we are running with fewer than 8 gpus
-    for i in range(len(inputs) // 64):
-        model(inputs[64*i:64*i+64], targets[64*i:64*i+64]).backward()
+def initialize_model(model: GPT, *, zero_proj: bool) -> None:
+    import torch.distributed as dist
+
     for name, param in model.named_parameters():
-        assert param.grad is not None, name
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-    # set optimization hyperparameters and take a step
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-        opt.step()
-    model.zero_grad(set_to_none=True)
-    approx_training_time = training_time + (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time:.3f}s"
-           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms", console=True)
+        if zero_proj and name.endswith("weight") and "proj" in name:
+            param.data.zero_()
+        dist.broadcast(param.detach(), 0)
 
-dist.destroy_process_group()
+
+def run_validation(
+    model: GPT,
+    val_loader,
+    *,
+    val_tokens: int,
+    micro_batch_size: int,
+) -> torch.Tensor:
+    import torch
+    import torch.distributed as dist
+
+    val_loss = torch.zeros((), device="cuda", dtype=torch.float32)
+    with torch.no_grad():
+        inputs, targets = next(val_loader)
+        for offset in range(0, len(inputs), micro_batch_size):
+            val_loss += model(inputs[offset:offset + micro_batch_size], targets[offset:offset + micro_batch_size])
+    dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+    return val_loss / val_tokens
+
+
+def run_training(args: argparse.Namespace) -> None:
+    import torch
+    import torch.distributed as dist
+
+    from simple_optim import build_optimizers
+
+    device = setup_distributed()
+    code_snapshot = read_code_snapshot()
+    print0 = make_logger(args.log_dir)
+    print0(code_snapshot)
+    print0("=" * 100)
+    print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+    log_resolved_config(args, print0)
+    print0("=" * 100)
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    model = build_model(args)
+    initialize_model(model, zero_proj=args.zero_proj)
+    optimizers = build_optimizers(
+        model,
+        adam_head_lr=args.adam_head_lr,
+        adam_embed_lr=args.adam_embed_lr,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        adam_eps=args.adam_eps,
+        adam_weight_decay=args.adam_weight_decay,
+        muon_lr=args.muon_lr,
+        muon_weight_decay=args.muon_weight_decay,
+        muon_momentum=args.muon_momentum,
+        fused_adamw=args.fused_adamw,
+    )
+
+    train_loader = distributed_data_generator(
+        args.train_pattern,
+        args.batch_size,
+        seq_len=args.seq_len,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+    )
+    training_time = 0.0
+
+    dist.barrier()
+    t0 = time.perf_counter()
+    for step in range(args.train_steps + 1):
+        is_last_step = step == args.train_steps
+
+        if is_last_step or step % args.val_interval == 0:
+            dist.barrier()
+            training_time += time.perf_counter() - t0
+            model.eval()
+            val_loader = distributed_data_generator(
+                args.val_pattern,
+                args.val_tokens,
+                seq_len=args.seq_len,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+            )
+            val_loss = run_validation(
+                model,
+                val_loader,
+                val_tokens=args.val_tokens,
+                micro_batch_size=args.micro_batch_size,
+            )
+            print0(
+                f"step:{step}/{args.train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+                f" step_avg:{1000 * training_time / max(step, 1):.2f}ms",
+                console=True,
+            )
+            model.train()
+            dist.barrier()
+            t0 = time.perf_counter()
+            if is_last_step:
+                break
+
+        inputs, targets = next(train_loader)
+        for offset in range(0, len(inputs), args.micro_batch_size):
+            model(inputs[offset:offset + args.micro_batch_size], targets[offset:offset + args.micro_batch_size]).backward()
+        for name, param in model.named_parameters():
+            assert param.grad is not None, name
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * get_lr(step, args.train_steps, args.cooldown_frac)
+            optimizer.step()
+        model.zero_grad(set_to_none=True)
+        approx_training_time = training_time + (time.perf_counter() - t0)
+        print0(
+            f"step:{step + 1}/{args.train_steps} train_time:{approx_training_time:.3f}s"
+            f" step_avg:{1000 * approx_training_time / (step + 1):.2f}ms",
+            console=True,
+        )
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(args)
+    try:
+        run_training(args)
+    finally:
+        try:
+            import torch.distributed as dist
+        except ModuleNotFoundError:
+            pass
+        else:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
