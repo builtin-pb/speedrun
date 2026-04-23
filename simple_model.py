@@ -109,9 +109,23 @@ class Block(nn.Module):
         )
         self.mlp = MLP(config.model_dim, expansion=config.mlp_expansion)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attn(norm(x))
-        x = x + self.mlp(norm(x))
+    def forward(self, x: Tensor, observer: Callable[[str, Tensor], None] | None = None, block_idx: int | None = None) -> Tensor:
+        if observer is not None:
+            assert block_idx is not None
+            observer(f"layer_attn/block_{block_idx:02d}_input_l2", x)
+        attn_out = self.attn(norm(x))
+        if observer is not None:
+            observer(f"layer_attn/block_{block_idx:02d}_update_l2", attn_out)
+        x = x + attn_out
+        if observer is not None:
+            observer(f"layer_attn/block_{block_idx:02d}_output_l2", x)
+            observer(f"layer_mlp/block_{block_idx:02d}_input_l2", x)
+        mlp_out = self.mlp(norm(x))
+        if observer is not None:
+            observer(f"layer_mlp/block_{block_idx:02d}_update_l2", mlp_out)
+        x = x + mlp_out
+        if observer is not None:
+            observer(f"layer_mlp/block_{block_idx:02d}_output_l2", x)
         return x
 
 
@@ -126,15 +140,11 @@ class GPT(nn.Module):
     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
         x = norm(self.embed(inputs))
         if observer is not None:
-            observer("embed/activation_l2", x)
+            observer("layer_embed/activation_l2", x)
         for block_idx, block in enumerate(self.blocks):
-            if observer is not None:
-                observer(f"block_{block_idx:02d}/residual_l2", x)
-            x = block(x)
-            if observer is not None:
-                observer(f"block_{block_idx:02d}/activation_l2", x)
+            x = block(x, observer=observer, block_idx=block_idx)
         if observer is not None:
-            observer("final/residual_l2", x)
+            observer("layer_final/residual_l2", x)
         return self.proj(norm(x)).float()
 
     def forward(self, inputs: Tensor, targets: Tensor) -> Tensor:

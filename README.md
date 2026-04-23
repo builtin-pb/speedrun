@@ -118,8 +118,8 @@ There is a starter notes stub in [experiments/README.md](experiments/README.md).
 Training also logs to W&B by default. The dashboard is organized into:
 - `main/*` for high-signal run health and throughput metrics
 - `logits/*` for sampled logits and softcap diagnostics; defaults sample 1 sequence per rank and can be changed with `--stability-sample-sequences`
-- `attn_q/*`, `attn_k/*`, `attn_v/*`, `attn_proj/*`, `mlp_fc/*`, `mlp_proj/*`, `embed/*`, and `lm_head/*` for parameter-type diagnostics
-- `block_00/*`, `block_01/*`, ... and `final/*` for sampled layer-level diagnostics that are not already captured by matrix norms
+- `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, `matrix_embed/*`, and `matrix_lm_head/*` for parameter-type diagnostics
+- `layer_embed/*`, `layer_attn/*`, `layer_mlp/*`, and `layer_final/*` for sampled layer-level diagnostics that are not already captured by matrix norms
 
 ## Repo Direction
 

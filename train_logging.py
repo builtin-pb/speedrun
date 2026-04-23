@@ -44,11 +44,22 @@ def setup_wandb(args, print0, *, rank: int):
     run.define_metric("tokens_seen")
     run.define_metric("main/*", step_metric="step")
     run.define_metric("logits/*", step_metric="step")
-    for metric_group in ["attn_q", "attn_k", "attn_v", "attn_proj", "mlp_fc", "mlp_proj", "embed", "lm_head", "other"]:
+    for metric_group in [
+        "layer_embed",
+        "layer_attn",
+        "layer_mlp",
+        "layer_final",
+        "matrix_attn_q",
+        "matrix_attn_k",
+        "matrix_attn_v",
+        "matrix_attn_proj",
+        "matrix_mlp_fc",
+        "matrix_mlp_proj",
+        "matrix_embed",
+        "matrix_lm_head",
+        "matrix_other",
+    ]:
         run.define_metric(f"{metric_group}/*", step_metric="step")
-    for block_idx in range(args.num_layers):
-        run.define_metric(f"block_{block_idx:02d}/*", step_metric="step")
-    run.define_metric("final/*", step_metric="step")
     print0(f"W&B run: {run.url}", console=True)
     return run
 
@@ -71,22 +82,26 @@ def tensor_metrics_to_floats(metric_tensors: dict[str, torch.Tensor]) -> dict[st
 
 def parameter_metric_name(name: str, kind: str) -> str:
     if name == "embed.weight":
-        return f"embed/{kind}"
+        return f"matrix_embed/{kind}"
     if name == "proj.weight":
-        return f"lm_head/{kind}"
+        return f"matrix_lm_head/{kind}"
     parts = name.split(".")
     if len(parts) >= 4 and parts[0] == "blocks":
         block_label = f"block_{int(parts[1]):02d}"
         if parts[2] == "attn":
-            mapping = {"q": "attn_q", "k": "attn_k", "v": "attn_v", "proj": "attn_proj"}
-            return f"{mapping.get(parts[3], parts[3])}/{block_label}_{kind}"
+            mapping = {"q": "matrix_attn_q", "k": "matrix_attn_k", "v": "matrix_attn_v", "proj": "matrix_attn_proj"}
+            metric_group = mapping.get(parts[3], "matrix_other")
+            metric_name = f"{block_label}_{kind}" if metric_group != "matrix_other" else f"{name.replace('.', '_')}_{kind}"
+            return f"{metric_group}/{metric_name}"
         if parts[2] == "mlp":
-            mapping = {"fc": "mlp_fc", "proj": "mlp_proj"}
-            return f"{mapping.get(parts[3], parts[3])}/{block_label}_{kind}"
-    return f"other/{name.replace('.', '_')}_{kind}"
+            mapping = {"fc": "matrix_mlp_fc", "proj": "matrix_mlp_proj"}
+            metric_group = mapping.get(parts[3], "matrix_other")
+            metric_name = f"{block_label}_{kind}" if metric_group != "matrix_other" else f"{name.replace('.', '_')}_{kind}"
+            return f"{metric_group}/{metric_name}"
+    return f"matrix_other/{name.replace('.', '_')}_{kind}"
 
 
-def collect_norm_metrics(model, *, include_layer: bool, include_matrix: bool) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+def collect_norm_metrics(model, *, include_matrix: bool) -> tuple[dict[str, float], dict[str, float]]:
     device = next(model.parameters()).device
     zero = lambda: torch.zeros((), device=device, dtype=torch.float32)
     global_grad_sq = zero()
@@ -130,7 +145,7 @@ def collect_norm_metrics(model, *, include_layer: bool, include_matrix: bool) ->
         "main/param_max_abs": param_max_abs,
     }
     main_metrics = tensor_metrics_to_floats(main_metric_tensors)
-    return main_metrics, {}, tensor_metrics_to_floats(matrix_metrics) if include_matrix else {}
+    return main_metrics, tensor_metrics_to_floats(matrix_metrics) if include_matrix else {}
 
 
 def log_run_metrics(run, metrics: dict[str, float]) -> None:

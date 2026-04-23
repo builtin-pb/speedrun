@@ -342,7 +342,7 @@ def run_training(args: argparse.Namespace) -> None:
             collect_main_metrics = should_log(current_step, args.wandb_log_interval)
             collect_layer_metrics = should_log(current_step, args.stability_log_interval)
             collect_matrix_metrics = should_log(current_step, args.matrix_log_interval)
-            collect_norm_diagnostics = collect_layer_metrics or collect_matrix_metrics
+            collect_norm_diagnostics = collect_matrix_metrics
             collect_stability_diagnostics = collect_layer_metrics
             collect_any_metrics = collect_main_metrics or collect_norm_diagnostics or collect_stability_diagnostics
 
@@ -385,13 +385,11 @@ def run_training(args: argparse.Namespace) -> None:
                 if collect_norm_diagnostics:
                     if rank == 0:
                         norm_metrics_start = time.perf_counter()
-                        main_norm_metrics, layer_norm_metrics, matrix_metrics = collect_norm_metrics(
+                        main_norm_metrics, matrix_metrics = collect_norm_metrics(
                             model,
-                            include_layer=collect_layer_metrics,
                             include_matrix=collect_matrix_metrics,
                         )
                         metrics_payload.update(main_norm_metrics)
-                        metrics_payload.update(layer_norm_metrics)
                         metrics_payload.update(matrix_metrics)
                         metrics_payload["main/norm_metrics_ms"] = 1000 * (time.perf_counter() - norm_metrics_start)
                 if collect_stability_diagnostics:
