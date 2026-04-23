@@ -16,8 +16,8 @@ import uuid
 from pathlib import Path
 
 from train_logging import (
-    StepMetricCollector,
     collect_norm_metrics,
+    collect_stability_metrics,
     log_run_metrics,
     log_static_model_metrics,
     setup_wandb,
@@ -340,26 +340,19 @@ def run_training(args: argparse.Namespace) -> None:
             collect_layer_metrics = should_log(current_step, args.stability_log_interval)
             collect_matrix_metrics = should_log(current_step, args.matrix_log_interval)
             collect_norm_diagnostics = collect_layer_metrics or collect_matrix_metrics
-            collect_stability_metrics = collect_layer_metrics
-            collect_any_metrics = collect_main_metrics or collect_norm_diagnostics or collect_stability_metrics
+            collect_stability_diagnostics = collect_layer_metrics
+            collect_any_metrics = collect_main_metrics or collect_norm_diagnostics or collect_stability_diagnostics
 
             step_start = time.perf_counter()
             inputs, targets = next(train_loader)
             train_loss = torch.zeros((), device=device, dtype=torch.float32)
-            step_metric_collector = None
-            if collect_stability_metrics:
-                step_metric_collector = StepMetricCollector(model, log_logits=True)
 
-            try:
-                for offset in range(0, len(inputs), args.micro_batch_size):
-                    input_chunk = inputs[offset:offset + args.micro_batch_size]
-                    target_chunk = targets[offset:offset + args.micro_batch_size]
-                    micro_loss = model(input_chunk, target_chunk)
-                    train_loss += micro_loss.detach()
-                    micro_loss.backward()
-            finally:
-                if step_metric_collector is not None:
-                    step_metric_collector.close()
+            for offset in range(0, len(inputs), args.micro_batch_size):
+                input_chunk = inputs[offset:offset + args.micro_batch_size]
+                target_chunk = targets[offset:offset + args.micro_batch_size]
+                micro_loss = model(input_chunk, target_chunk)
+                train_loss += micro_loss.detach()
+                micro_loss.backward()
 
             dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
             for name, param in model.named_parameters():
@@ -382,7 +375,7 @@ def run_training(args: argparse.Namespace) -> None:
                         "main/lr_adam_head": optimizers[0].param_groups[0]["lr"],
                         "main/lr_adam_embed": optimizers[0].param_groups[1]["lr"],
                         "main/lr_muon": optimizers[1].param_groups[0]["lr"],
-                        "main/instrumentation_active": float(collect_norm_diagnostics or collect_stability_metrics),
+                        "main/instrumentation_active": float(collect_norm_diagnostics or collect_stability_diagnostics),
                     }
                 )
                 if collect_norm_diagnostics:
@@ -395,8 +388,15 @@ def run_training(args: argparse.Namespace) -> None:
                         metrics_payload.update(main_norm_metrics)
                         metrics_payload.update(layer_norm_metrics)
                         metrics_payload.update(matrix_metrics)
-                if step_metric_collector is not None:
-                    metrics_payload.update(step_metric_collector.finalize(rank=rank))
+                if collect_stability_diagnostics:
+                    metrics_payload.update(
+                        collect_stability_metrics(
+                            model,
+                            inputs,
+                            micro_batch_size=args.micro_batch_size,
+                            rank=rank,
+                        )
+                    )
 
             for optimizer in optimizers:
                 optimizer.step()
@@ -405,7 +405,7 @@ def run_training(args: argparse.Namespace) -> None:
             if collect_any_metrics:
                 step_time_ms = 1000 * step_time_s
                 tokens_per_sec = args.batch_size / max(step_time_s, 1e-9)
-                if collect_norm_diagnostics or collect_stability_metrics:
+                if collect_norm_diagnostics or collect_stability_diagnostics:
                     metrics_payload["main/instrumented_step_time_ms"] = step_time_ms
                     metrics_payload["main/instrumented_tokens_per_sec"] = tokens_per_sec
                 else:

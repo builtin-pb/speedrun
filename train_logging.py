@@ -4,7 +4,6 @@ import os
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 
 def validate_wandb_setup() -> None:
@@ -157,105 +156,66 @@ def log_static_model_metrics(run, print0, *, model) -> None:
     log_run_metrics(run, static_metrics)
 
 
-class StepMetricCollector:
-    def __init__(self, model, *, log_logits: bool):
-        self.log_logits = log_logits
-        self.softcap = model.config.logit_softcap
-        self.handles = []
-        self.scalar_sums: dict[str, torch.Tensor] = {}
-        self.scalar_counts: dict[str, torch.Tensor] = {}
-        self.logit_sums: dict[str, torch.Tensor] = {}
-        self._register(model)
+def _add_mean_l2(metric_tensors: dict[str, torch.Tensor], name: str, tensor: torch.Tensor) -> None:
+    norms = torch.linalg.vector_norm(tensor.detach().float(), dim=-1)
+    zero = torch.zeros((), device=norms.device, dtype=torch.float32)
+    metric_tensors[f"{name}__sum"] = metric_tensors.get(f"{name}__sum", zero) + norms.sum()
+    metric_tensors[f"{name}__count"] = metric_tensors.get(f"{name}__count", zero) + norms.new_tensor(norms.numel(), dtype=torch.float32)
 
-    def _add_mean_l2(self, name: str, tensor: torch.Tensor) -> None:
-        norms = torch.linalg.vector_norm(tensor.detach().float(), dim=-1)
-        self.scalar_sums[name] = self.scalar_sums.get(name, torch.zeros((), device=norms.device, dtype=torch.float32)) + norms.sum()
-        self.scalar_counts[name] = self.scalar_counts.get(name, torch.zeros((), device=norms.device, dtype=torch.float32)) + norms.new_tensor(
-            norms.numel(), dtype=torch.float32
-        )
 
-    def _record_embed_output(self, _module, _inputs, output) -> None:
-        self._add_mean_l2("embed/activation_l2", F.rms_norm(output.detach().float(), (output.size(-1),)))
+def collect_stability_metrics(model, inputs: torch.Tensor, *, micro_batch_size: int, rank: int) -> dict[str, float]:
+    from simple_model import norm
 
-    def _make_block_pre_hook(self, block_idx: int):
-        name = f"block_{block_idx:02d}/residual_l2"
+    metric_tensors: dict[str, torch.Tensor] = {}
+    softcap = model.config.logit_softcap
+    with torch.no_grad():
+        for offset in range(0, len(inputs), micro_batch_size):
+            input_chunk = inputs[offset:offset + micro_batch_size]
+            x = norm(model.embed(input_chunk))
+            _add_mean_l2(metric_tensors, "embed/activation_l2", x)
 
-        def hook(_module, inputs) -> None:
-            self._add_mean_l2(name, inputs[0])
+            for block_idx, block in enumerate(model.blocks):
+                _add_mean_l2(metric_tensors, f"block_{block_idx:02d}/residual_l2", x)
+                x = block(x)
+                _add_mean_l2(metric_tensors, f"block_{block_idx:02d}/activation_l2", x)
+            _add_mean_l2(metric_tensors, "final/residual_l2", x)
 
-        return hook
+            logits = model.proj(norm(x)).float()
+            zero = torch.zeros((), device=logits.device, dtype=torch.float32)
+            metric_tensors["logits/sum"] = metric_tensors.get("logits/sum", zero) + logits.sum()
+            metric_tensors["logits/sumsq"] = metric_tensors.get("logits/sumsq", zero) + logits.square().sum()
+            metric_tensors["logits/count"] = metric_tensors.get("logits/count", zero) + logits.new_tensor(logits.numel(), dtype=torch.float32)
+            metric_tensors["logits/max_abs"] = torch.maximum(metric_tensors.get("logits/max_abs", zero), logits.abs().amax())
+            softcapped = softcap * logits * torch.rsqrt(logits.square() + softcap**2)
+            sat_count = (softcapped.abs() >= 0.95 * softcap).sum().float()
+            metric_tensors["logits/softcap_sat_count"] = metric_tensors.get("logits/softcap_sat_count", zero) + sat_count
 
-    def _make_block_post_hook(self, block_idx: int, *, is_last: bool):
-        name = f"block_{block_idx:02d}/activation_l2"
+    if not metric_tensors:
+        return {}
 
-        def hook(_module, _inputs, output) -> None:
-            self._add_mean_l2(name, output)
-            if is_last:
-                self._add_mean_l2("final/residual_l2", output)
+    sum_keys = sorted(key for key in metric_tensors if key != "logits/max_abs")
+    reduced_sum_values = torch.stack([metric_tensors[key].detach().to(dtype=torch.float32) for key in sum_keys])
+    dist.all_reduce(reduced_sum_values, op=dist.ReduceOp.SUM)
+    reduced_sums = {key: value for key, value in zip(sum_keys, reduced_sum_values)}
 
-        return hook
+    reduced_max = metric_tensors["logits/max_abs"].detach().to(dtype=torch.float32)
+    dist.all_reduce(reduced_max, op=dist.ReduceOp.MAX)
 
-    def _record_logits(self, _module, _inputs, output) -> None:
-        logits = output.detach().float()
-        zero = torch.zeros((), device=logits.device, dtype=torch.float32)
-        self.logit_sums["logits/sum"] = self.logit_sums.get("logits/sum", zero) + logits.sum()
-        self.logit_sums["logits/sumsq"] = self.logit_sums.get("logits/sumsq", zero) + logits.square().sum()
-        self.logit_sums["logits/count"] = self.logit_sums.get("logits/count", zero) + logits.new_tensor(logits.numel(), dtype=torch.float32)
-        self.logit_sums["logits/max_abs"] = torch.maximum(self.logit_sums.get("logits/max_abs", zero), logits.abs().amax())
-        softcapped = self.softcap * logits * torch.rsqrt(logits.square() + self.softcap**2)
-        sat_count = (softcapped.abs() >= 0.95 * self.softcap).sum().float()
-        self.logit_sums["logits/softcap_sat_count"] = self.logit_sums.get("logits/softcap_sat_count", zero) + sat_count
+    if rank != 0:
+        return {}
 
-    def _register(self, model) -> None:
-        self.handles.append(model.embed.register_forward_hook(self._record_embed_output))
-        last_block_idx = len(model.blocks) - 1
-        for block_idx, block in enumerate(model.blocks):
-            self.handles.append(block.register_forward_pre_hook(self._make_block_pre_hook(block_idx)))
-            self.handles.append(block.register_forward_hook(self._make_block_post_hook(block_idx, is_last=block_idx == last_block_idx)))
-        if self.log_logits:
-            self.handles.append(model.proj.register_forward_hook(self._record_logits))
+    finalized: dict[str, float] = {}
+    mean_metric_names = sorted(key.removesuffix("__sum") for key in reduced_sums if key.endswith("__sum"))
+    for key in mean_metric_names:
+        total_sum = reduced_sums[f"{key}__sum"]
+        total_count = reduced_sums[f"{key}__count"].clamp_min(1.0)
+        finalized[key] = float((total_sum / total_count).cpu().item())
 
-    def close(self) -> None:
-        for handle in self.handles:
-            handle.remove()
-
-    def finalize(self, *, rank: int) -> dict[str, float]:
-        metric_tensors: dict[str, torch.Tensor] = {}
-        for key, sum_value in self.scalar_sums.items():
-            metric_tensors[f"{key}__sum"] = sum_value
-            metric_tensors[f"{key}__count"] = self.scalar_counts[key]
-        if self.log_logits:
-            for key, value in self.logit_sums.items():
-                metric_tensors[key] = value
-        if not metric_tensors:
-            return {}
-
-        sum_keys = sorted(key for key in metric_tensors if key != "logits/max_abs")
-        reduced_sum_values = torch.stack([metric_tensors[key].detach().to(dtype=torch.float32) for key in sum_keys])
-        dist.all_reduce(reduced_sum_values, op=dist.ReduceOp.SUM)
-        reduced_sums = {key: value for key, value in zip(sum_keys, reduced_sum_values)}
-
-        reduced_max = None
-        if "logits/max_abs" in metric_tensors:
-            reduced_max = metric_tensors["logits/max_abs"].detach().to(dtype=torch.float32)
-            dist.all_reduce(reduced_max, op=dist.ReduceOp.MAX)
-
-        if rank != 0:
-            return {}
-
-        finalized: dict[str, float] = {}
-        for key in self.scalar_sums:
-            total_sum = reduced_sums[f"{key}__sum"]
-            total_count = reduced_sums[f"{key}__count"].clamp_min(1.0)
-            finalized[key] = float((total_sum / total_count).cpu().item())
-        if self.log_logits:
-            logits_count = reduced_sums["logits/count"].clamp_min(1.0)
-            logits_mean = reduced_sums["logits/sum"] / logits_count
-            logits_var = reduced_sums["logits/sumsq"] / logits_count - logits_mean.square()
-            finalized["logits/mean"] = float(logits_mean.cpu().item())
-            finalized["logits/std"] = float(logits_var.clamp_min(0.0).sqrt().cpu().item())
-            finalized["logits/max_abs"] = float(reduced_max.cpu().item())
-            finalized["logits/softcap_saturation_frac"] = float(
-                (reduced_sums["logits/softcap_sat_count"] / logits_count).cpu().item()
-            )
-        return finalized
+    logits_count = reduced_sums["logits/count"].clamp_min(1.0)
+    logits_mean = reduced_sums["logits/sum"] / logits_count
+    logits_var = reduced_sums["logits/sumsq"] / logits_count - logits_mean.square()
+    finalized["logits/mean"] = float(logits_mean.cpu().item())
+    finalized["logits/std"] = float(logits_var.clamp_min(0.0).sqrt().cpu().item())
+    finalized["logits/max_abs"] = float(reduced_max.cpu().item())
+    finalized["logits/softcap_saturation_frac"] = float((reduced_sums["logits/softcap_sat_count"] / logits_count).cpu().item())
+    return finalized
