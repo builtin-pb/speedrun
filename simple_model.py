@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections.abc import Callable
 
 import torch
 from torch import Tensor, nn
@@ -122,11 +123,22 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
         self.proj = Linear(config.model_dim, config.vocab_size)
 
-    def forward(self, inputs: Tensor, targets: Tensor) -> Tensor:
+    def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
         x = norm(self.embed(inputs))
-        for block in self.blocks:
+        if observer is not None:
+            observer("embed/activation_l2", x)
+        for block_idx, block in enumerate(self.blocks):
+            if observer is not None:
+                observer(f"block_{block_idx:02d}/residual_l2", x)
             x = block(x)
-        logits = self.proj(norm(x)).float()
+            if observer is not None:
+                observer(f"block_{block_idx:02d}/activation_l2", x)
+        if observer is not None:
+            observer("final/residual_l2", x)
+        return self.proj(norm(x)).float()
+
+    def forward(self, inputs: Tensor, targets: Tensor) -> Tensor:
+        logits = self.compute_raw_logits(inputs)
         softcap = self.config.logit_softcap
         logits = softcap * logits * torch.rsqrt(logits.square() + softcap**2)
         return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")

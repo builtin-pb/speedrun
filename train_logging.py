@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 
 import torch
 import torch.distributed as dist
@@ -163,31 +164,33 @@ def _add_mean_l2(metric_tensors: dict[str, torch.Tensor], name: str, tensor: tor
     metric_tensors[f"{name}__count"] = metric_tensors.get(f"{name}__count", zero) + norms.new_tensor(norms.numel(), dtype=torch.float32)
 
 
-def collect_stability_metrics(model, inputs: torch.Tensor, *, micro_batch_size: int, rank: int) -> dict[str, float]:
-    from simple_model import norm
-
+def collect_stability_metrics(
+    model,
+    inputs: torch.Tensor,
+    *,
+    micro_batch_size: int,
+    max_sequences: int,
+    rank: int,
+) -> dict[str, float]:
     metric_tensors: dict[str, torch.Tensor] = {}
     softcap = model.config.logit_softcap
-    with torch.no_grad():
-        for offset in range(0, len(inputs), micro_batch_size):
-            input_chunk = inputs[offset:offset + micro_batch_size]
-            x = norm(model.embed(input_chunk))
-            _add_mean_l2(metric_tensors, "embed/activation_l2", x)
+    sample_count = min(len(inputs), max_sequences)
+    seq_len = inputs.size(1)
+    saturation_threshold = softcap * 0.95 / math.sqrt(1 - 0.95**2)
 
-            for block_idx, block in enumerate(model.blocks):
-                _add_mean_l2(metric_tensors, f"block_{block_idx:02d}/residual_l2", x)
-                x = block(x)
-                _add_mean_l2(metric_tensors, f"block_{block_idx:02d}/activation_l2", x)
-            _add_mean_l2(metric_tensors, "final/residual_l2", x)
+    def observe(name: str, tensor: torch.Tensor) -> None:
+        _add_mean_l2(metric_tensors, name, tensor)
 
-            logits = model.proj(norm(x)).float()
+    with torch.inference_mode():
+        for offset in range(0, sample_count, micro_batch_size):
+            input_chunk = inputs[offset:min(offset + micro_batch_size, sample_count)]
+            logits = model.compute_raw_logits(input_chunk, observer=observe)
             zero = torch.zeros((), device=logits.device, dtype=torch.float32)
             metric_tensors["logits/sum"] = metric_tensors.get("logits/sum", zero) + logits.sum()
-            metric_tensors["logits/sumsq"] = metric_tensors.get("logits/sumsq", zero) + logits.square().sum()
+            metric_tensors["logits/sumsq"] = metric_tensors.get("logits/sumsq", zero) + torch.linalg.vector_norm(logits).square()
             metric_tensors["logits/count"] = metric_tensors.get("logits/count", zero) + logits.new_tensor(logits.numel(), dtype=torch.float32)
             metric_tensors["logits/max_abs"] = torch.maximum(metric_tensors.get("logits/max_abs", zero), logits.abs().amax())
-            softcapped = softcap * logits * torch.rsqrt(logits.square() + softcap**2)
-            sat_count = (softcapped.abs() >= 0.95 * softcap).sum().float()
+            sat_count = torch.count_nonzero(logits.abs() >= saturation_threshold).float()
             metric_tensors["logits/softcap_sat_count"] = metric_tensors.get("logits/softcap_sat_count", zero) + sat_count
 
     if not metric_tensors:
@@ -205,6 +208,9 @@ def collect_stability_metrics(model, inputs: torch.Tensor, *, micro_batch_size: 
         return {}
 
     finalized: dict[str, float] = {}
+    finalized["main/stability_sample_sequences_per_rank"] = float(sample_count)
+    finalized["main/stability_sample_tokens_per_rank"] = float(sample_count * seq_len)
+    finalized["main/stability_sample_fraction_per_rank"] = float(sample_count / max(len(inputs), 1))
     mean_metric_names = sorted(key.removesuffix("__sum") for key in reduced_sums if key.endswith("__sum"))
     for key in mean_metric_names:
         total_sum = reduced_sums[f"{key}__sum"]

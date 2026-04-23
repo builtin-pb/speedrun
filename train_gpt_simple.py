@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-dir", default="wandb")
     parser.add_argument("--wandb-log-interval", type=int, default=1)
     parser.add_argument("--stability-log-interval", type=int, default=25)
+    parser.add_argument("--stability-sample-sequences", type=int, default=1, help="Per-rank sequences used for sampled activation/logit diagnostics.")
     parser.add_argument("--matrix-log-interval", type=int, default=125)
 
     parser.add_argument("--vocab-size", type=int, default=50304)
@@ -101,6 +102,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--wandb-log-interval must be positive")
     if args.stability_log_interval <= 0:
         raise ValueError("--stability-log-interval must be positive")
+    if args.stability_sample_sequences <= 0:
+        raise ValueError("--stability-sample-sequences must be positive")
     if args.matrix_log_interval <= 0:
         raise ValueError("--matrix-log-interval must be positive")
 
@@ -375,11 +378,13 @@ def run_training(args: argparse.Namespace) -> None:
                         "main/lr_adam_head": optimizers[0].param_groups[0]["lr"],
                         "main/lr_adam_embed": optimizers[0].param_groups[1]["lr"],
                         "main/lr_muon": optimizers[1].param_groups[0]["lr"],
-                        "main/instrumentation_active": float(collect_norm_diagnostics or collect_stability_diagnostics),
+                        "main/norm_instrumentation_active": float(collect_norm_diagnostics),
+                        "main/stability_replay_active": float(collect_stability_diagnostics),
                     }
                 )
                 if collect_norm_diagnostics:
                     if rank == 0:
+                        norm_metrics_start = time.perf_counter()
                         main_norm_metrics, layer_norm_metrics, matrix_metrics = collect_norm_metrics(
                             model,
                             include_layer=collect_layer_metrics,
@@ -388,15 +393,20 @@ def run_training(args: argparse.Namespace) -> None:
                         metrics_payload.update(main_norm_metrics)
                         metrics_payload.update(layer_norm_metrics)
                         metrics_payload.update(matrix_metrics)
+                        metrics_payload["main/norm_metrics_ms"] = 1000 * (time.perf_counter() - norm_metrics_start)
                 if collect_stability_diagnostics:
+                    stability_metrics_start = time.perf_counter()
                     metrics_payload.update(
                         collect_stability_metrics(
                             model,
                             inputs,
                             micro_batch_size=args.micro_batch_size,
+                            max_sequences=args.stability_sample_sequences,
                             rank=rank,
                         )
                     )
+                    if rank == 0:
+                        metrics_payload["main/stability_metrics_ms"] = 1000 * (time.perf_counter() - stability_metrics_start)
 
             for optimizer in optimizers:
                 optimizer.step()
