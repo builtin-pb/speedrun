@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -33,11 +32,16 @@ class _DummyStabilityModel:
             dtype=torch.float32,
         )
         residual = torch.ones((1, 2, 4), dtype=torch.float32)
+        matrix_activation = torch.full((1, 2, 4), 2.0, dtype=torch.float32)
         if observer is not None:
+            observer("matrix_embed/act_abs", matrix_activation)
             observer("layer_embed/activation_rms", activation)
             observer("layer_attn/block_00_update_rms", update)
             observer("layer_final/residual_rms", residual)
-        return torch.zeros((inputs.size(0), inputs.size(1), 3), dtype=torch.float32)
+        return torch.tensor(
+            [[[9.0, -9.0, 8.0, 7.0, 6.0], [5.0, -8.0, -7.0, -6.0, -5.0]]],
+            dtype=torch.float32,
+        )
 
 
 class TrainLoggingTests(unittest.TestCase):
@@ -63,25 +67,32 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertNotIn("matrix_embed/param_l2", matrix_metrics)
         self.assertNotIn("matrix_lm_head/grad_l2", matrix_metrics)
 
-    def test_collect_stability_metrics_reports_rms_for_activation_update_and_residual_metrics(self) -> None:
+    def test_collect_stability_metrics_reports_reduced_metrics_without_logits_max_abs(self) -> None:
         model = _DummyStabilityModel()
         inputs = torch.zeros((1, 2), dtype=torch.long)
 
-        with patch("train_logging.dist.all_reduce", side_effect=lambda tensor, op=None: None):
-            metrics = collect_stability_metrics(
-                model,
-                inputs,
-                micro_batch_size=1,
-                max_sequences=1,
-                rank=0,
-            )
+        metrics = collect_stability_metrics(
+            model,
+            inputs,
+            micro_batch_size=1,
+            max_sequences=1,
+            rank=0,
+        )
 
         self.assertAlmostEqual(metrics["layer_embed/activation_rms"], math.sqrt(25.0 / 8.0))
         self.assertAlmostEqual(metrics["layer_attn/block_00_update_rms"], math.sqrt(100.0 / 8.0))
         self.assertAlmostEqual(metrics["layer_final/residual_rms"], 1.0)
+        self.assertEqual(metrics["logits/top1"], 9.0)
+        self.assertEqual(metrics["logits/top5_mean"], 7.0)
+        self.assertEqual(metrics["logits/bottom1"], -9.0)
+        self.assertEqual(metrics["logits/bottom5_mean"], -7.0)
+        self.assertEqual(metrics["matrix_embed/act_abs_p50"], 2.0)
+        self.assertEqual(metrics["matrix_embed/act_abs_p90"], 2.0)
+        self.assertEqual(metrics["matrix_embed/act_abs_p99"], 2.0)
         self.assertNotIn("layer_embed/activation_l2", metrics)
         self.assertNotIn("layer_attn/block_00_update_l2", metrics)
         self.assertNotIn("layer_final/residual_l2", metrics)
+        self.assertNotIn("logits/max_abs", metrics)
 
     def test_simple_model_emits_rms_names_for_requested_observer_metrics(self) -> None:
         model = GPT(GPTConfig(vocab_size=16, num_layers=1, model_dim=4, head_dim=4, mlp_expansion=1))
@@ -104,11 +115,14 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertIn("layer_attn/block_00_output_rms", seen)
         self.assertIn("layer_mlp/block_00_input_rms", seen)
         self.assertIn("layer_mlp/block_00_output_rms", seen)
+        self.assertIn("matrix_embed/act_abs", seen)
+        self.assertIn("matrix_attn_q/block_00_act_abs", seen)
+        self.assertIn("matrix_attn_k/block_00_act_abs", seen)
+        self.assertIn("matrix_attn_v/block_00_act_abs", seen)
+        self.assertIn("matrix_attn_proj/block_00_act_abs", seen)
+        self.assertIn("matrix_mlp_fc/block_00_act_abs", seen)
+        self.assertIn("matrix_mlp_proj/block_00_act_abs", seen)
         self.assertNotIn("layer_attn/block_00_input_l2", seen)
         self.assertNotIn("layer_attn/block_00_output_l2", seen)
         self.assertNotIn("layer_mlp/block_00_input_l2", seen)
         self.assertNotIn("layer_mlp/block_00_output_l2", seen)
-
-
-if __name__ == "__main__":
-    unittest.main()

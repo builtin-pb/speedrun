@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from collections.abc import Callable
+import math
 
 import torch
 from torch import Tensor, nn
@@ -22,12 +23,31 @@ def norm(x: Tensor) -> Tensor:
     return F.rms_norm(x, (x.size(-1),))
 
 
+def spectral_init_std(in_features: int, out_features: int, *, scale: float = 1.0) -> float:
+    return scale * math.sqrt(out_features / in_features) / (math.sqrt(in_features) + math.sqrt(out_features))
+
+
+def residual_proj_init_scale(*, num_layers: int) -> float:
+    return 1.0 / math.sqrt(num_layers)
+
+
+def lm_head_init_std(*, model_dim: int) -> float:
+    return 1.0 / model_dim
+
+
 class Linear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int):
+    def __init__(self, in_features: int, out_features: int, *, init_scale: float = 1.0):
         super().__init__(in_features, out_features, bias=False)
+        nn.init.normal_(self.weight, mean=0.0, std=spectral_init_std(in_features, out_features, scale=init_scale))
 
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(x, self.weight.bfloat16())
+
+
+class LMHead(Linear):
+    def __init__(self, model_dim: int, vocab_size: int):
+        super().__init__(model_dim, vocab_size)
+        nn.init.normal_(self.weight, mean=0.0, std=lm_head_init_std(model_dim=model_dim))
 
 
 class Rotary(nn.Module):
@@ -53,7 +73,15 @@ class Rotary(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, rope_base: float, attention_scale: float):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        rope_base: float,
+        attention_scale: float,
+        *,
+        proj_init_scale: float,
+    ):
         super().__init__()
         if dim % head_dim != 0:
             raise ValueError(f"model_dim must be divisible by head_dim, got {dim=} and {head_dim=}")
@@ -64,14 +92,27 @@ class CausalSelfAttention(nn.Module):
         self.q = Linear(dim, hdim)
         self.k = Linear(dim, hdim)
         self.v = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim)
+        self.proj = Linear(hdim, dim, init_scale=proj_init_scale)
         self.rotary = Rotary(head_dim, rope_base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        observer: Callable[[str, Tensor], None] | None = None,
+        block_idx: int | None = None,
+    ) -> Tensor:
         batch_size, seq_len = x.shape[:2]
-        q = self.q(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.v(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        q = self.q(x)
+        k = self.k(x)
+        v = self.v(x)
+        if observer is not None:
+            assert block_idx is not None
+            observer(f"matrix_attn_q/block_{block_idx:02d}_act_abs", q)
+            observer(f"matrix_attn_k/block_{block_idx:02d}_act_abs", k)
+            observer(f"matrix_attn_v/block_{block_idx:02d}_act_abs", v)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
         y = F.scaled_dot_product_attention(
@@ -82,45 +123,65 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
         ).transpose(1, 2)
         y = y.contiguous().view(batch_size, seq_len, self.num_heads * self.head_dim)
-        return self.proj(y)
+        y = self.proj(y)
+        if observer is not None:
+            observer(f"matrix_attn_proj/block_{block_idx:02d}_act_abs", y)
+        return y
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, expansion: int):
+    def __init__(self, dim: int, expansion: int, *, proj_init_scale: float):
         super().__init__()
         hdim = expansion * dim
         self.fc = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim)
+        self.proj = Linear(hdim, dim, init_scale=proj_init_scale)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        observer: Callable[[str, Tensor], None] | None = None,
+        block_idx: int | None = None,
+    ) -> Tensor:
         x = self.fc(x)
+        if observer is not None:
+            assert block_idx is not None
+            observer(f"matrix_mlp_fc/block_{block_idx:02d}_act_abs", x)
         x = F.relu(x).square()
-        return self.proj(x)
+        x = self.proj(x)
+        if observer is not None:
+            observer(f"matrix_mlp_proj/block_{block_idx:02d}_act_abs", x)
+        return x
 
 
 class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
+        proj_init_scale = residual_proj_init_scale(num_layers=config.num_layers)
         self.attn = CausalSelfAttention(
             config.model_dim,
             head_dim=config.head_dim,
             rope_base=config.rope_base,
             attention_scale=config.attention_scale,
+            proj_init_scale=proj_init_scale,
         )
-        self.mlp = MLP(config.model_dim, expansion=config.mlp_expansion)
+        self.mlp = MLP(
+            config.model_dim,
+            expansion=config.mlp_expansion,
+            proj_init_scale=proj_init_scale,
+        )
 
     def forward(self, x: Tensor, observer: Callable[[str, Tensor], None] | None = None, block_idx: int | None = None) -> Tensor:
         if observer is not None:
             assert block_idx is not None
             observer(f"layer_attn/block_{block_idx:02d}_input_rms", x)
-        attn_out = self.attn(norm(x))
+        attn_out = self.attn(norm(x), observer=observer, block_idx=block_idx)
         if observer is not None:
             observer(f"layer_attn/block_{block_idx:02d}_update_rms", attn_out)
         x = x + attn_out
         if observer is not None:
             observer(f"layer_attn/block_{block_idx:02d}_output_rms", x)
             observer(f"layer_mlp/block_{block_idx:02d}_input_rms", x)
-        mlp_out = self.mlp(norm(x))
+        mlp_out = self.mlp(norm(x), observer=observer, block_idx=block_idx)
         if observer is not None:
             observer(f"layer_mlp/block_{block_idx:02d}_update_rms", mlp_out)
         x = x + mlp_out
@@ -134,11 +195,15 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.model_dim).bfloat16()
+        nn.init.normal_(self.embed.weight, mean=0.0, std=1.0)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
-        self.proj = Linear(config.model_dim, config.vocab_size)
+        self.proj = LMHead(config.model_dim, config.vocab_size)
 
     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
-        x = norm(self.embed(inputs))
+        x = self.embed(inputs)
+        if observer is not None:
+            observer("matrix_embed/act_abs", x)
+        x = norm(x)
         if observer is not None:
             observer("layer_embed/activation_rms", x)
         for block_idx, block in enumerate(self.blocks):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from lr_schedule import get_lr_scale, resolve_schedule, validate_schedule
+from train_gpt_simple import get_lr_scale, resolve_schedule, validate_schedule
 
 
 class LrScheduleTests(unittest.TestCase):
@@ -25,7 +25,3 @@ class LrScheduleTests(unittest.TestCase):
     def test_rejects_overlapping_warmup_and_cooldown(self) -> None:
         with self.assertRaisesRegex(ValueError, "must not exceed 1"):
             validate_schedule(train_steps=10, warmup_frac=0.5, cooldown_frac=0.6)
-
-
-if __name__ == "__main__":
-    unittest.main()

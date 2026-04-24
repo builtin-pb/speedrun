@@ -15,18 +15,6 @@ import time
 import uuid
 from pathlib import Path
 
-from lr_schedule import get_lr_scale, validate_schedule
-from train_logging import (
-    collect_norm_metrics,
-    collect_stability_metrics,
-    log_run_metrics,
-    log_static_model_metrics,
-    setup_wandb,
-    should_log,
-    tensor_scalar,
-    validate_wandb_setup,
-)
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -43,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-interval", type=int, default=125)
     parser.add_argument("--val-tokens", type=int, default=10_485_760)
     parser.add_argument("--warmup-frac", type=float, default=0.0, help="Fraction of optimizer steps used for linear LR warmup.")
-    parser.add_argument("--cooldown-frac", type=float, default=0.7)
+    parser.add_argument("--cooldown-frac", type=float, default=0.5)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--wandb-project", default="modded-nanogpt")
     parser.add_argument("--wandb-entity")
@@ -64,7 +52,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-scale", type=float, default=0.12)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--zero-proj", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--adam-head-lr", type=float, default=1 / 320)
     parser.add_argument("--adam-embed-lr", type=float, default=0.3)
@@ -81,6 +68,43 @@ def build_parser() -> argparse.ArgumentParser:
 
 def read_code_snapshot() -> str:
     return Path(__file__).read_text()
+
+
+def validate_schedule(*, train_steps: int, warmup_frac: float, cooldown_frac: float) -> None:
+    if train_steps <= 0:
+        raise ValueError("--train-steps must be positive")
+    if not 0 <= warmup_frac < 1:
+        raise ValueError("--warmup-frac must be in [0, 1)")
+    if not 0 < cooldown_frac <= 1:
+        raise ValueError("--cooldown-frac must be in (0, 1]")
+    if warmup_frac + cooldown_frac > 1:
+        raise ValueError("--warmup-frac plus --cooldown-frac must not exceed 1")
+
+
+def resolve_schedule(*, train_steps: int, warmup_frac: float, cooldown_frac: float) -> tuple[int, int]:
+    validate_schedule(
+        train_steps=train_steps,
+        warmup_frac=warmup_frac,
+        cooldown_frac=cooldown_frac,
+    )
+    warmup_steps = int(train_steps * warmup_frac)
+    cooldown_steps = int(train_steps * cooldown_frac)
+    return warmup_steps, cooldown_steps
+
+
+def get_lr_scale(step: int, *, train_steps: int, warmup_frac: float, cooldown_frac: float) -> float:
+    warmup_steps, cooldown_steps = resolve_schedule(
+        train_steps=train_steps,
+        warmup_frac=warmup_frac,
+        cooldown_frac=cooldown_frac,
+    )
+    if not 0 <= step < train_steps:
+        raise ValueError("step must be in [0, train_steps)")
+    if warmup_steps and step < warmup_steps:
+        return (step + 1) / warmup_steps
+    if cooldown_steps and step >= train_steps - cooldown_steps:
+        return (train_steps - step) / cooldown_steps
+    return 1.0
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -198,6 +222,7 @@ def distributed_data_generator(
         pos += batch_size
         yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
 
+
 def build_model(args: argparse.Namespace) -> GPT:
     from simple_model import GPT, GPTConfig
 
@@ -217,12 +242,10 @@ def build_model(args: argparse.Namespace) -> GPT:
     return model
 
 
-def initialize_model(model: GPT, *, zero_proj: bool) -> None:
+def broadcast_model_parameters(model: GPT) -> None:
     import torch.distributed as dist
 
-    for name, param in model.named_parameters():
-        if zero_proj and name.endswith("weight") and "proj" in name:
-            param.data.zero_()
+    for _, param in model.named_parameters():
         dist.broadcast(param.detach(), 0)
 
 
@@ -250,6 +273,15 @@ def run_training(args: argparse.Namespace) -> None:
     import torch.distributed as dist
 
     from simple_optim import build_optimizers
+    from train_logging import (
+        collect_norm_metrics,
+        collect_stability_metrics,
+        log_run_metrics,
+        log_static_model_metrics,
+        setup_wandb,
+        should_log,
+        tensor_scalar,
+    )
 
     device = setup_distributed()
     code_snapshot = read_code_snapshot()
@@ -264,7 +296,7 @@ def run_training(args: argparse.Namespace) -> None:
     world_size = dist.get_world_size()
     run = setup_wandb(args, print0, rank=rank)
     model = build_model(args)
-    initialize_model(model, zero_proj=args.zero_proj)
+    broadcast_model_parameters(model)
     log_static_model_metrics(run, print0, model=model)
     optimizers = build_optimizers(
         model,
@@ -433,6 +465,8 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    from train_logging import validate_wandb_setup
+
     parser = build_parser()
     args = parser.parse_args()
     validate_args(args)
