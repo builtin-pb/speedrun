@@ -3,3 +3,7 @@ pylog124M/
 __pycache__/
 logs/
 .DS_Store
+wandb/
+run_multiple.sh
+research_list.md
+experiments/
