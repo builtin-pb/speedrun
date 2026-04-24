@@ -205,8 +205,10 @@ def collect_stability_metrics(
             metric_tensors["logits/sumsq"] = metric_tensors.get("logits/sumsq", zero) + torch.linalg.vector_norm(logits).square()
             metric_tensors["logits/count"] = metric_tensors.get("logits/count", zero) + logits.new_tensor(logits.numel(), dtype=torch.float32)
             metric_tensors["logits/max_abs"] = torch.maximum(metric_tensors.get("logits/max_abs", zero), logits.abs().amax())
-            sat_count = torch.count_nonzero(logits.abs() >= saturation_threshold).float()
-            metric_tensors["logits/softcap_sat_count"] = metric_tensors.get("logits/softcap_sat_count", zero) + sat_count
+            pos_sat_count = torch.count_nonzero(logits >= saturation_threshold).float()
+            neg_sat_count = torch.count_nonzero(logits <= -saturation_threshold).float()
+            metric_tensors["logits/softcap_pos_sat_count"] = metric_tensors.get("logits/softcap_pos_sat_count", zero) + pos_sat_count
+            metric_tensors["logits/softcap_neg_sat_count"] = metric_tensors.get("logits/softcap_neg_sat_count", zero) + neg_sat_count
 
     if not metric_tensors:
         return {}
@@ -238,5 +240,8 @@ def collect_stability_metrics(
     finalized["logits/mean"] = float(logits_mean.cpu().item())
     finalized["logits/std"] = float(logits_var.clamp_min(0.0).sqrt().cpu().item())
     finalized["logits/max_abs"] = float(reduced_max.cpu().item())
-    finalized["logits/softcap_saturation_frac"] = float((reduced_sums["logits/softcap_sat_count"] / logits_count).cpu().item())
+    pos_sat_frac = reduced_sums["logits/softcap_pos_sat_count"] / logits_count
+    neg_sat_frac = reduced_sums["logits/softcap_neg_sat_count"] / logits_count
+    finalized["logits/softcap_positive_saturation_frac"] = float(pos_sat_frac.cpu().item())
+    finalized["logits/softcap_negative_saturation_frac"] = float(neg_sat_frac.cpu().item())
     return finalized

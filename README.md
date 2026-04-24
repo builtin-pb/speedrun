@@ -173,7 +173,8 @@ Sampled logits metrics:
 - `logits/mean`
 - `logits/std`
 - `logits/max_abs`
-- `logits/softcap_saturation_frac`
+- `logits/softcap_positive_saturation_frac`
+- `logits/softcap_negative_saturation_frac`
 
 Matrix norm metrics:
 - `matrix_embed/param_l2`
