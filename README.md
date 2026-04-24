@@ -129,7 +129,8 @@ There is a starter notes stub in [experiments/README.md](experiments/README.md).
 Training also logs to W&B by default. The dashboard is organized into:
 - `main/*` for high-signal run health and throughput metrics
 - `logits/*` for sampled logits and softcap diagnostics; defaults sample 1 sequence per rank and can be changed with `--stability-sample-sequences`
-- `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, `matrix_embed/*`, and `matrix_lm_head/*` for parameter-type diagnostics
+- `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, and `matrix_embed/*` for matrix diagnostics, including parameter RMS, gradient RMS, and sampled activation-tail summaries
+- `matrix_lm_head/*` for LM-head parameter and gradient diagnostics
 - `layer_embed/*`, `layer_attn/*`, `layer_mlp/*`, and `layer_final/*` for sampled layer-level RMS diagnostics that are complementary to the matrix parameter/gradient metrics
 
 ### W&B Metric Reference
@@ -175,27 +176,54 @@ Sampled logits metrics:
 - `logits/mean`
 - `logits/std`
 - `logits/max_abs`
+- `logits/top1`
+- `logits/top5_mean`
+- `logits/bottom1`
+- `logits/bottom5_mean`
 - `logits/softcap_positive_saturation_frac`
 - `logits/softcap_negative_saturation_frac`
 
-Matrix RMS metrics:
+Matrix metrics:
 - `matrix_embed/param_rms`
 - `matrix_embed/grad_rms`
+- `matrix_embed/act_abs_p50`
+- `matrix_embed/act_abs_p90`
+- `matrix_embed/act_abs_p99`
 - `matrix_lm_head/param_rms`
 - `matrix_lm_head/grad_rms`
 - `matrix_attn_q/block_XX_param_rms`
 - `matrix_attn_q/block_XX_grad_rms`
+- `matrix_attn_q/block_XX_act_abs_p50`
+- `matrix_attn_q/block_XX_act_abs_p90`
+- `matrix_attn_q/block_XX_act_abs_p99`
 - `matrix_attn_k/block_XX_param_rms`
 - `matrix_attn_k/block_XX_grad_rms`
+- `matrix_attn_k/block_XX_act_abs_p50`
+- `matrix_attn_k/block_XX_act_abs_p90`
+- `matrix_attn_k/block_XX_act_abs_p99`
 - `matrix_attn_v/block_XX_param_rms`
 - `matrix_attn_v/block_XX_grad_rms`
+- `matrix_attn_v/block_XX_act_abs_p50`
+- `matrix_attn_v/block_XX_act_abs_p90`
+- `matrix_attn_v/block_XX_act_abs_p99`
 - `matrix_attn_proj/block_XX_param_rms`
 - `matrix_attn_proj/block_XX_grad_rms`
+- `matrix_attn_proj/block_XX_act_abs_p50`
+- `matrix_attn_proj/block_XX_act_abs_p90`
+- `matrix_attn_proj/block_XX_act_abs_p99`
 - `matrix_mlp_fc/block_XX_param_rms`
 - `matrix_mlp_fc/block_XX_grad_rms`
+- `matrix_mlp_fc/block_XX_act_abs_p50`
+- `matrix_mlp_fc/block_XX_act_abs_p90`
+- `matrix_mlp_fc/block_XX_act_abs_p99`
 - `matrix_mlp_proj/block_XX_param_rms`
 - `matrix_mlp_proj/block_XX_grad_rms`
+- `matrix_mlp_proj/block_XX_act_abs_p50`
+- `matrix_mlp_proj/block_XX_act_abs_p90`
+- `matrix_mlp_proj/block_XX_act_abs_p99`
 - `matrix_other/*` for future parameters that do not match a known matrix group
+
+Activation-tail quantiles are computed on a random capped sample of absolute values per observed tensor during stability replay, not on every element.
 
 Sampled layer metrics:
 - `layer_embed/activation_rms`
