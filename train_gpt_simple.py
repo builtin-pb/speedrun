@@ -58,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rope-base", type=float, default=1024.0)
     parser.add_argument("--attention-scale", type=float, default=0.12)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
+    parser.add_argument("--embed-init-scale", type=float, default=1.0)
+    parser.add_argument("--lm-head-init-scale", type=float, default=1.0)
+    parser.add_argument("--attn-q-init-scale", type=float, default=1.0)
+    parser.add_argument("--attn-k-init-scale", type=float, default=1.0)
+    parser.add_argument("--attn-v-init-scale", type=float, default=1.0)
+    parser.add_argument("--attn-proj-init-scale", type=float, default=1.0)
+    parser.add_argument("--mlp-fc-init-scale", type=float, default=1.0)
+    parser.add_argument("--mlp-proj-init-scale", type=float, default=1.0)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--adam-head-lr", type=float, default=1 / 320)
@@ -142,6 +150,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--stability-sample-sequences must be positive")
     if args.matrix_log_interval <= 0:
         raise ValueError("--matrix-log-interval must be positive")
+    for arg_name in (
+        "embed_init_scale",
+        "lm_head_init_scale",
+        "attn_q_init_scale",
+        "attn_k_init_scale",
+        "attn_v_init_scale",
+        "attn_proj_init_scale",
+        "mlp_fc_init_scale",
+        "mlp_proj_init_scale",
+    ):
+        if getattr(args, arg_name) < 0:
+            raise ValueError(f"--{arg_name.replace('_', '-')} must be non-negative")
 
 
 def setup_distributed() -> torch.device:
@@ -244,6 +264,14 @@ def build_gpt_config(args: argparse.Namespace):
         rope_base=args.rope_base,
         attention_scale=args.attention_scale,
         logit_softcap=args.logit_softcap,
+        embed_init_scale=args.embed_init_scale,
+        lm_head_init_scale=args.lm_head_init_scale,
+        attn_q_init_scale=args.attn_q_init_scale,
+        attn_k_init_scale=args.attn_k_init_scale,
+        attn_v_init_scale=args.attn_v_init_scale,
+        attn_proj_init_scale=args.attn_proj_init_scale,
+        mlp_fc_init_scale=args.mlp_fc_init_scale,
+        mlp_proj_init_scale=args.mlp_proj_init_scale,
     )
 
 

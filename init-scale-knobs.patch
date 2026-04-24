@@ -1,0 +1,322 @@
+diff --git a/README.md b/README.md
+index 0d0b7c5..2105534 100644
+--- a/README.md
++++ b/README.md
+@@ -71,12 +71,18 @@ Add linear LR warmup:
+ ./run_simple.sh --warmup-frac 0.05
+ ```
+ 
+-The default init policy is fixed in code:
++The default init policy is:
+ - muP-style hidden-layer spectral init
+ - embedding init std `1.0`
+ - LM-head init std `1 / model_dim`
+ - attention and MLP residual projection init additionally scaled by `1 / sqrt(num_layers)`
+ 
++Each parameter kind also has a multiplicative init-scale knob that defaults to `1.0`:
++
++```bash
++./run_simple.sh --embed-init-scale 0.5 --attn-proj-init-scale 0.75 --mlp-proj-init-scale 0.75
++```
++
+ Try a different model size:
+ 
+ ```bash
+diff --git a/simple_model.py b/simple_model.py
+index 3e5182d..def7666 100644
+--- a/simple_model.py
++++ b/simple_model.py
+@@ -19,12 +19,33 @@ class GPTConfig:
+     logit_softcap: float = 15.0
+     layer_norm_position: str = "pre"
+     residual_depth_scale: str = "init"
++    embed_init_scale: float = 1.0
++    lm_head_init_scale: float = 1.0
++    attn_q_init_scale: float = 1.0
++    attn_k_init_scale: float = 1.0
++    attn_v_init_scale: float = 1.0
++    attn_proj_init_scale: float = 1.0
++    mlp_fc_init_scale: float = 1.0
++    mlp_proj_init_scale: float = 1.0
+ 
+     def __post_init__(self) -> None:
+         if self.layer_norm_position not in {"pre", "post"}:
+             raise ValueError(f"layer_norm_position must be 'pre' or 'post', got {self.layer_norm_position!r}")
+         if self.residual_depth_scale not in {"none", "init", "forward"}:
+             raise ValueError(f"residual_depth_scale must be 'none', 'init', or 'forward', got {self.residual_depth_scale!r}")
++        for field_name in (
++            "embed_init_scale",
++            "lm_head_init_scale",
++            "attn_q_init_scale",
++            "attn_k_init_scale",
++            "attn_v_init_scale",
++            "attn_proj_init_scale",
++            "mlp_fc_init_scale",
++            "mlp_proj_init_scale",
++        ):
++            value = getattr(self, field_name)
++            if value < 0:
++                raise ValueError(f"{field_name} must be non-negative, got {value}")
+ 
+ 
+ def norm(x: Tensor) -> Tensor:
+@@ -57,9 +78,9 @@ class Linear(nn.Linear):
+ 
+ 
+ class LMHead(Linear):
+-    def __init__(self, model_dim: int, vocab_size: int):
++    def __init__(self, model_dim: int, vocab_size: int, *, init_scale: float = 1.0):
+         super().__init__(model_dim, vocab_size)
+-        nn.init.normal_(self.weight, mean=0.0, std=lm_head_init_std(model_dim=model_dim))
++        nn.init.normal_(self.weight, mean=0.0, std=lm_head_init_std(model_dim=model_dim) * init_scale)
+ 
+ 
+ class Rotary(nn.Module):
+@@ -92,6 +113,9 @@ class CausalSelfAttention(nn.Module):
+         rope_base: float,
+         attention_scale: float,
+         *,
++        q_init_scale: float,
++        k_init_scale: float,
++        v_init_scale: float,
+         proj_init_scale: float,
+     ):
+         super().__init__()
+@@ -101,9 +125,9 @@ class CausalSelfAttention(nn.Module):
+         self.head_dim = head_dim
+         self.attention_scale = attention_scale
+         hdim = self.num_heads * self.head_dim
+-        self.q = Linear(dim, hdim)
+-        self.k = Linear(dim, hdim)
+-        self.v = Linear(dim, hdim)
++        self.q = Linear(dim, hdim, init_scale=q_init_scale)
++        self.k = Linear(dim, hdim, init_scale=k_init_scale)
++        self.v = Linear(dim, hdim, init_scale=v_init_scale)
+         self.proj = Linear(hdim, dim, init_scale=proj_init_scale)
+         self.rotary = Rotary(head_dim, rope_base=rope_base)
+ 
+@@ -142,10 +166,10 @@ class CausalSelfAttention(nn.Module):
+ 
+ 
+ class MLP(nn.Module):
+-    def __init__(self, dim: int, expansion: int, *, proj_init_scale: float):
++    def __init__(self, dim: int, expansion: int, *, fc_init_scale: float, proj_init_scale: float):
+         super().__init__()
+         hdim = expansion * dim
+-        self.fc = Linear(dim, hdim)
++        self.fc = Linear(dim, hdim, init_scale=fc_init_scale)
+         self.proj = Linear(hdim, dim, init_scale=proj_init_scale)
+ 
+     def forward(
+@@ -173,18 +197,22 @@ class Block(nn.Module):
+             num_layers=config.num_layers,
+             residual_depth_scale=config.residual_depth_scale,
+         )
+-        proj_init_scale = residual_proj_init_scale(num_layers=config.num_layers) if config.residual_depth_scale == "init" else 1.0
++        residual_init_scale = residual_proj_init_scale(num_layers=config.num_layers) if config.residual_depth_scale == "init" else 1.0
+         self.attn = CausalSelfAttention(
+             config.model_dim,
+             head_dim=config.head_dim,
+             rope_base=config.rope_base,
+             attention_scale=config.attention_scale,
+-            proj_init_scale=proj_init_scale,
++            q_init_scale=config.attn_q_init_scale,
++            k_init_scale=config.attn_k_init_scale,
++            v_init_scale=config.attn_v_init_scale,
++            proj_init_scale=residual_init_scale * config.attn_proj_init_scale,
+         )
+         self.mlp = MLP(
+             config.model_dim,
+             expansion=config.mlp_expansion,
+-            proj_init_scale=proj_init_scale,
++            fc_init_scale=config.mlp_fc_init_scale,
++            proj_init_scale=residual_init_scale * config.mlp_proj_init_scale,
+         )
+ 
+     def forward(self, x: Tensor, observer: Callable[[str, Tensor], None] | None = None, block_idx: int | None = None) -> Tensor:
+@@ -220,9 +248,9 @@ class GPT(nn.Module):
+         super().__init__()
+         self.config = config
+         self.embed = nn.Embedding(config.vocab_size, config.model_dim).bfloat16()
+-        nn.init.normal_(self.embed.weight, mean=0.0, std=1.0)
++        nn.init.normal_(self.embed.weight, mean=0.0, std=config.embed_init_scale)
+         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
+-        self.proj = LMHead(config.model_dim, config.vocab_size)
++        self.proj = LMHead(config.model_dim, config.vocab_size, init_scale=config.lm_head_init_scale)
+ 
+     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
+         x = self.embed(inputs)
+diff --git a/tests/test_simple_model_init.py b/tests/test_simple_model_init.py
+index 1b462b9..e64115e 100644
+--- a/tests/test_simple_model_init.py
++++ b/tests/test_simple_model_init.py
+@@ -59,3 +59,41 @@ class SimpleModelInitializationTests(unittest.TestCase):
+ 
+                 self.assertAlmostEqual(attn_proj_std, spectral_std(256, 256), delta=0.003)
+                 self.assertAlmostEqual(mlp_proj_std, spectral_std(1024, 256), delta=0.003)
++
++    def test_init_scale_knobs_multiply_each_parameter_kind(self) -> None:
++        torch.manual_seed(0)
++        config = GPTConfig(
++            vocab_size=4096,
++            num_layers=4,
++            model_dim=256,
++            head_dim=64,
++            mlp_expansion=4,
++            embed_init_scale=0.25,
++            lm_head_init_scale=1.5,
++            attn_q_init_scale=2.0,
++            attn_k_init_scale=0.5,
++            attn_v_init_scale=1.25,
++            attn_proj_init_scale=0.75,
++            mlp_fc_init_scale=1.75,
++            mlp_proj_init_scale=0.6,
++        )
++
++        model = GPT(config)
++
++        q_std = float(model.blocks[0].attn.q.weight.float().std(unbiased=False).item())
++        k_std = float(model.blocks[0].attn.k.weight.float().std(unbiased=False).item())
++        v_std = float(model.blocks[0].attn.v.weight.float().std(unbiased=False).item())
++        attn_proj_std = float(model.blocks[0].attn.proj.weight.float().std(unbiased=False).item())
++        fc_std = float(model.blocks[0].mlp.fc.weight.float().std(unbiased=False).item())
++        mlp_proj_std = float(model.blocks[0].mlp.proj.weight.float().std(unbiased=False).item())
++        lm_head_std = float(model.proj.weight.float().std(unbiased=False).item())
++        embed_std = float(model.embed.weight.float().std(unbiased=False).item())
++
++        self.assertAlmostEqual(q_std, spectral_std(256, 256, scale=2.0), delta=0.006)
++        self.assertAlmostEqual(k_std, spectral_std(256, 256, scale=0.5), delta=0.002)
++        self.assertAlmostEqual(v_std, spectral_std(256, 256, scale=1.25), delta=0.004)
++        self.assertAlmostEqual(attn_proj_std, spectral_std(256, 256, scale=0.5 * 0.75), delta=0.002)
++        self.assertAlmostEqual(fc_std, spectral_std(256, 1024, scale=1.75), delta=0.006)
++        self.assertAlmostEqual(mlp_proj_std, spectral_std(1024, 256, scale=0.5 * 0.6), delta=0.002)
++        self.assertAlmostEqual(lm_head_std, 1.5 / config.model_dim, delta=0.0008)
++        self.assertAlmostEqual(embed_std, 0.25, delta=0.02)
+diff --git a/tests/test_train_args.py b/tests/test_train_args.py
+index fac7e28..3b31711 100644
+--- a/tests/test_train_args.py
++++ b/tests/test_train_args.py
+@@ -8,7 +8,7 @@ from io import StringIO
+ from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+-from train_gpt_simple import build_gpt_config, build_parser
++from train_gpt_simple import build_gpt_config, build_parser, validate_args
+ 
+ 
+ class TrainArgsTests(unittest.TestCase):
+@@ -43,7 +43,30 @@ class TrainArgsTests(unittest.TestCase):
+             build_parser().parse_args(["--residual-depth-scale", "sometimes"])
+ 
+     def test_build_gpt_config_passes_norm_and_residual_scale_knobs(self) -> None:
+-        args = build_parser().parse_args(["--layer-norm-position", "post", "--residual-depth-scale", "none"])
++        args = build_parser().parse_args(
++            [
++                "--layer-norm-position",
++                "post",
++                "--residual-depth-scale",
++                "none",
++                "--embed-init-scale",
++                "0.25",
++                "--lm-head-init-scale",
++                "1.5",
++                "--attn-q-init-scale",
++                "2.0",
++                "--attn-k-init-scale",
++                "0.5",
++                "--attn-v-init-scale",
++                "1.25",
++                "--attn-proj-init-scale",
++                "0.75",
++                "--mlp-fc-init-scale",
++                "1.75",
++                "--mlp-proj-init-scale",
++                "0.6",
++            ]
++        )
+         fake_simple_model = types.ModuleType("simple_model")
+         fake_simple_model.GPTConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+ 
+@@ -52,3 +75,29 @@ class TrainArgsTests(unittest.TestCase):
+ 
+         self.assertEqual(config.layer_norm_position, "post")
+         self.assertEqual(config.residual_depth_scale, "none")
++        self.assertEqual(config.embed_init_scale, 0.25)
++        self.assertEqual(config.lm_head_init_scale, 1.5)
++        self.assertEqual(config.attn_q_init_scale, 2.0)
++        self.assertEqual(config.attn_k_init_scale, 0.5)
++        self.assertEqual(config.attn_v_init_scale, 1.25)
++        self.assertEqual(config.attn_proj_init_scale, 0.75)
++        self.assertEqual(config.mlp_fc_init_scale, 1.75)
++        self.assertEqual(config.mlp_proj_init_scale, 0.6)
++
++    def test_init_scale_knobs_default_to_one(self) -> None:
++        args = build_parser().parse_args([])
++
++        self.assertEqual(args.embed_init_scale, 1.0)
++        self.assertEqual(args.lm_head_init_scale, 1.0)
++        self.assertEqual(args.attn_q_init_scale, 1.0)
++        self.assertEqual(args.attn_k_init_scale, 1.0)
++        self.assertEqual(args.attn_v_init_scale, 1.0)
++        self.assertEqual(args.attn_proj_init_scale, 1.0)
++        self.assertEqual(args.mlp_fc_init_scale, 1.0)
++        self.assertEqual(args.mlp_proj_init_scale, 1.0)
++
++    def test_init_scale_knobs_reject_negative_values(self) -> None:
++        args = build_parser().parse_args(["--mlp-proj-init-scale", "-0.1"])
++
++        with self.assertRaisesRegex(ValueError, "--mlp-proj-init-scale"):
++            validate_args(args)
+diff --git a/train_gpt_simple.py b/train_gpt_simple.py
+index 7185f17..48cc27f 100644
+--- a/train_gpt_simple.py
++++ b/train_gpt_simple.py
+@@ -58,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
+     parser.add_argument("--rope-base", type=float, default=1024.0)
+     parser.add_argument("--attention-scale", type=float, default=0.12)
+     parser.add_argument("--logit-softcap", type=float, default=15.0)
++    parser.add_argument("--embed-init-scale", type=float, default=1.0)
++    parser.add_argument("--lm-head-init-scale", type=float, default=1.0)
++    parser.add_argument("--attn-q-init-scale", type=float, default=1.0)
++    parser.add_argument("--attn-k-init-scale", type=float, default=1.0)
++    parser.add_argument("--attn-v-init-scale", type=float, default=1.0)
++    parser.add_argument("--attn-proj-init-scale", type=float, default=1.0)
++    parser.add_argument("--mlp-fc-init-scale", type=float, default=1.0)
++    parser.add_argument("--mlp-proj-init-scale", type=float, default=1.0)
+     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+ 
+     parser.add_argument("--adam-head-lr", type=float, default=1 / 320)
+@@ -142,6 +150,18 @@ def validate_args(args: argparse.Namespace) -> None:
+         raise ValueError("--stability-sample-sequences must be positive")
+     if args.matrix_log_interval <= 0:
+         raise ValueError("--matrix-log-interval must be positive")
++    for arg_name in (
++        "embed_init_scale",
++        "lm_head_init_scale",
++        "attn_q_init_scale",
++        "attn_k_init_scale",
++        "attn_v_init_scale",
++        "attn_proj_init_scale",
++        "mlp_fc_init_scale",
++        "mlp_proj_init_scale",
++    ):
++        if getattr(args, arg_name) < 0:
++            raise ValueError(f"--{arg_name.replace('_', '-')} must be non-negative")
+ 
+ 
+ def setup_distributed() -> torch.device:
+@@ -244,6 +264,14 @@ def build_gpt_config(args: argparse.Namespace):
+         rope_base=args.rope_base,
+         attention_scale=args.attention_scale,
+         logit_softcap=args.logit_softcap,
++        embed_init_scale=args.embed_init_scale,
++        lm_head_init_scale=args.lm_head_init_scale,
++        attn_q_init_scale=args.attn_q_init_scale,
++        attn_k_init_scale=args.attn_k_init_scale,
++        attn_v_init_scale=args.attn_v_init_scale,
++        attn_proj_init_scale=args.attn_proj_init_scale,
++        mlp_fc_init_scale=args.mlp_fc_init_scale,
++        mlp_proj_init_scale=args.mlp_proj_init_scale,
+     )
+ 
+ 

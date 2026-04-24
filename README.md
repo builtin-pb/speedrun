@@ -71,11 +71,17 @@ Add linear LR warmup:
 ./run_simple.sh --warmup-frac 0.05
 ```
 
-The default init policy is fixed in code:
+The default init policy is:
 - muP-style hidden-layer spectral init
 - embedding init std `1.0`
 - LM-head init std `1 / model_dim`
 - attention and MLP residual projection init additionally scaled by `1 / sqrt(num_layers)`
+
+Each parameter kind also has a multiplicative init-scale knob that defaults to `1.0`:
+
+```bash
+./run_simple.sh --embed-init-scale 0.5 --attn-proj-init-scale 0.75 --mlp-proj-init-scale 0.75
+```
 
 Try a different model size:
 
