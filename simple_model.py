@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 from collections.abc import Callable
-import math
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+from init_policy import lm_head_init_std, residual_proj_init_scale, spectral_init_std
 
 
 @dataclass(frozen=True)
@@ -17,29 +18,48 @@ class GPTConfig:
     rope_base: float = 1024.0
     attention_scale: float = 0.12
     logit_softcap: float = 15.0
+    hidden_init_scale: float = 1.0
+    proj_init_div_by_sqrt_depth: bool = False
+    embed_init_std: float = 1.0
+    lm_head_init: str = "mup"
+    lm_head_mup_scale: float = 1.0
 
 
 def norm(x: Tensor) -> Tensor:
     return F.rms_norm(x, (x.size(-1),))
 
 
-def spectral_init_std(in_features: int, out_features: int) -> float:
-    return math.sqrt(out_features / in_features) / (math.sqrt(in_features) + math.sqrt(out_features))
-
-
 class Linear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int):
+    def __init__(self, in_features: int, out_features: int, *, init_scale: float = 1.0):
         super().__init__(in_features, out_features, bias=False)
-        nn.init.normal_(self.weight, mean=0.0, std=spectral_init_std(in_features, out_features))
+        nn.init.normal_(self.weight, mean=0.0, std=spectral_init_std(in_features, out_features, scale=init_scale))
 
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(x, self.weight.bfloat16())
 
 
 class LMHead(Linear):
-    def __init__(self, model_dim: int, vocab_size: int):
-        super().__init__(model_dim, vocab_size)
-        nn.init.normal_(self.weight, mean=0.0, std=1 / model_dim)
+    def __init__(
+        self,
+        model_dim: int,
+        vocab_size: int,
+        *,
+        hidden_init_scale: float,
+        embed_init_std: float,
+        init_mode: str,
+        mup_scale: float,
+    ):
+        super().__init__(model_dim, vocab_size, init_scale=hidden_init_scale)
+        std = lm_head_init_std(
+            init_mode,
+            model_dim=model_dim,
+            embed_init_std=embed_init_std,
+            mup_lm_head_scale=mup_scale,
+        )
+        if std is None:
+            nn.Linear.reset_parameters(self)
+        else:
+            nn.init.normal_(self.weight, mean=0.0, std=std)
 
 
 class Rotary(nn.Module):
@@ -65,7 +85,16 @@ class Rotary(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, rope_base: float, attention_scale: float):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        rope_base: float,
+        attention_scale: float,
+        *,
+        hidden_init_scale: float,
+        proj_init_scale: float,
+    ):
         super().__init__()
         if dim % head_dim != 0:
             raise ValueError(f"model_dim must be divisible by head_dim, got {dim=} and {head_dim=}")
@@ -73,10 +102,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = head_dim
         self.attention_scale = attention_scale
         hdim = self.num_heads * self.head_dim
-        self.q = Linear(dim, hdim)
-        self.k = Linear(dim, hdim)
-        self.v = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim)
+        self.q = Linear(dim, hdim, init_scale=hidden_init_scale)
+        self.k = Linear(dim, hdim, init_scale=hidden_init_scale)
+        self.v = Linear(dim, hdim, init_scale=hidden_init_scale)
+        self.proj = Linear(hdim, dim, init_scale=proj_init_scale)
         self.rotary = Rotary(head_dim, rope_base=rope_base)
 
     def forward(
@@ -114,11 +143,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, expansion: int):
+    def __init__(self, dim: int, expansion: int, *, hidden_init_scale: float, proj_init_scale: float):
         super().__init__()
         hdim = expansion * dim
-        self.fc = Linear(dim, hdim)
-        self.proj = Linear(hdim, dim)
+        self.fc = Linear(dim, hdim, init_scale=hidden_init_scale)
+        self.proj = Linear(hdim, dim, init_scale=proj_init_scale)
 
     def forward(
         self,
@@ -140,13 +169,25 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
+        proj_init_scale = residual_proj_init_scale(
+            config.hidden_init_scale,
+            num_layers=config.num_layers,
+            divide_by_sqrt_depth=config.proj_init_div_by_sqrt_depth,
+        )
         self.attn = CausalSelfAttention(
             config.model_dim,
             head_dim=config.head_dim,
             rope_base=config.rope_base,
             attention_scale=config.attention_scale,
+            hidden_init_scale=config.hidden_init_scale,
+            proj_init_scale=proj_init_scale,
         )
-        self.mlp = MLP(config.model_dim, expansion=config.mlp_expansion)
+        self.mlp = MLP(
+            config.model_dim,
+            expansion=config.mlp_expansion,
+            hidden_init_scale=config.hidden_init_scale,
+            proj_init_scale=proj_init_scale,
+        )
 
     def forward(self, x: Tensor, observer: Callable[[str, Tensor], None] | None = None, block_idx: int | None = None) -> Tensor:
         if observer is not None:
@@ -173,9 +214,16 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.model_dim).bfloat16()
-        nn.init.normal_(self.embed.weight, mean=0.0, std=1.0)
+        nn.init.normal_(self.embed.weight, mean=0.0, std=config.embed_init_std)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
-        self.proj = LMHead(config.model_dim, config.vocab_size)
+        self.proj = LMHead(
+            config.model_dim,
+            config.vocab_size,
+            hidden_init_scale=config.hidden_init_scale,
+            embed_init_std=config.embed_init_std,
+            init_mode=config.lm_head_init,
+            mup_scale=config.lm_head_mup_scale,
+        )
 
     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
         x = self.embed(inputs)

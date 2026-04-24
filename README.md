@@ -77,6 +77,18 @@ Try a different model size:
 ./run_simple.sh --num-layers 8 --model-dim 512
 ```
 
+Try a different init policy:
+
+```bash
+./run_simple.sh --hidden-init-scale 0.8 --embed-init-std 0.7 --no-zero-proj --lm-head-init embedding
+```
+
+Try depth-scaled residual projection init:
+
+```bash
+./run_simple.sh --no-zero-proj --proj-init-div-by-sqrt-depth
+```
+
 Short smoke run:
 
 ```bash
@@ -99,6 +111,17 @@ Learning-rate schedule notes:
 - `--warmup-frac` linearly ramps each optimizer group for `int(train_steps * warmup_frac)` updates; for example `0.05` means the first 5% of optimizer steps
 - `--cooldown-frac` keeps the existing linear cooldown over the final fraction of training
 - `--warmup-frac + --cooldown-frac` must not exceed `1`, so warmup, plateau, and cooldown stay non-overlapping
+
+Initialization notes:
+- `--hidden-init-scale` multiplies the spectral hidden-layer init used in `simple_model.py`
+- `--proj-init-div-by-sqrt-depth` additionally divides `attn.proj` and `mlp.proj` init scales by `sqrt(num_layers)`
+- `--embed-init-std` sets the embedding weight init std
+- `--lm-head-init` selects the final output projection init:
+  - `mup`: std `lm_head_mup_scale / model_dim`
+  - `embedding`: reuse `embed_init_std`
+  - `torch-default`: PyTorch `nn.Linear` default init
+- `--lm-head-mup-scale` scales the `mup` LM-head init
+- `--zero-proj` still zeros every `proj.weight` after model construction, including the LM head, so LM-head init differences only matter when using `--no-zero-proj`
 
 ## First-Time Setup
 

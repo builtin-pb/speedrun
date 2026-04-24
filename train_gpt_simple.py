@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+from init_policy import LM_HEAD_INIT_MODES
 from lr_schedule import get_lr_scale, validate_schedule
 from train_logging import (
     collect_norm_metrics,
@@ -63,6 +64,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rope-base", type=float, default=1024.0)
     parser.add_argument("--attention-scale", type=float, default=0.12)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
+    parser.add_argument("--hidden-init-scale", type=float, default=1.0, help="Multiplier on the hidden-layer spectral init std.")
+    parser.add_argument(
+        "--proj-init-div-by-sqrt-depth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Divide attention/MLP residual projection init scales by sqrt(num_layers).",
+    )
+    parser.add_argument("--embed-init-std", type=float, default=1.0, help="Embedding weight init std.")
+    parser.add_argument(
+        "--lm-head-init",
+        choices=LM_HEAD_INIT_MODES,
+        default="mup",
+        help="Final output projection init: custom muP-style, embedding-matched, or PyTorch default.",
+    )
+    parser.add_argument(
+        "--lm-head-mup-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for muP-style LM-head init; effective std is lm_head_mup_scale / model_dim.",
+    )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--zero-proj", action=argparse.BooleanOptionalAction, default=True)
 
@@ -111,6 +132,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--stability-sample-sequences must be positive")
     if args.matrix_log_interval <= 0:
         raise ValueError("--matrix-log-interval must be positive")
+    if args.hidden_init_scale <= 0:
+        raise ValueError("--hidden-init-scale must be positive")
+    if args.embed_init_std <= 0:
+        raise ValueError("--embed-init-std must be positive")
+    if args.lm_head_mup_scale <= 0:
+        raise ValueError("--lm-head-mup-scale must be positive")
 
 
 def setup_distributed() -> torch.device:
@@ -210,6 +237,11 @@ def build_model(args: argparse.Namespace) -> GPT:
         rope_base=args.rope_base,
         attention_scale=args.attention_scale,
         logit_softcap=args.logit_softcap,
+        hidden_init_scale=args.hidden_init_scale,
+        proj_init_div_by_sqrt_depth=args.proj_init_div_by_sqrt_depth,
+        embed_init_std=args.embed_init_std,
+        lm_head_init=args.lm_head_init,
+        lm_head_mup_scale=args.lm_head_mup_scale,
     )
     model = GPT(config).cuda()
     if args.compile:
