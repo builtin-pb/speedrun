@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+from lr_schedule import get_lr_scale, validate_schedule
 from train_logging import (
     collect_norm_metrics,
     collect_stability_metrics,
@@ -41,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-steps", type=int, default=3800)
     parser.add_argument("--val-interval", type=int, default=125)
     parser.add_argument("--val-tokens", type=int, default=10_485_760)
+    parser.add_argument("--warmup-frac", type=float, default=0.0, help="Fraction of optimizer steps used for linear LR warmup.")
     parser.add_argument("--cooldown-frac", type=float, default=0.7)
     parser.add_argument("--log-dir", default="logs")
     parser.add_argument("--wandb-project", default="modded-nanogpt")
@@ -96,8 +98,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--val-interval must be positive")
     if args.val_tokens <= 0:
         raise ValueError("--val-tokens must be positive")
-    if not 0 < args.cooldown_frac <= 1:
-        raise ValueError("--cooldown-frac must be in (0, 1]")
+    validate_schedule(
+        train_steps=args.train_steps,
+        warmup_frac=args.warmup_frac,
+        cooldown_frac=args.cooldown_frac,
+    )
     if args.wandb_log_interval <= 0:
         raise ValueError("--wandb-log-interval must be positive")
     if args.stability_log_interval <= 0:
@@ -192,15 +197,6 @@ def distributed_data_generator(
         targets = buf[1:].to(device=device, dtype=torch.int64, non_blocking=True)
         pos += batch_size
         yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
-
-
-def get_lr(step: int, train_steps: int, cooldown_frac: float) -> float:
-    progress = step / train_steps
-    assert 0 <= progress < 1
-    if progress < 1 - cooldown_frac:
-        return 1.0
-    return (1 - progress) / cooldown_frac
-
 
 def build_model(args: argparse.Namespace) -> GPT:
     from simple_model import GPT, GPTConfig
@@ -364,7 +360,12 @@ def run_training(args: argparse.Namespace) -> None:
 
             train_loss_value = tensor_scalar(train_loss / args.batch_size)
             metrics_payload: dict[str, float] = {}
-            lr_scale = get_lr(step, args.train_steps, args.cooldown_frac)
+            lr_scale = get_lr_scale(
+                step,
+                train_steps=args.train_steps,
+                warmup_frac=args.warmup_frac,
+                cooldown_frac=args.cooldown_frac,
+            )
             for optimizer in optimizers:
                 for group in optimizer.param_groups:
                     group["lr"] = group["initial_lr"] * lr_scale

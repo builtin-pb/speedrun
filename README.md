@@ -65,6 +65,12 @@ Change optimizer and learning rate:
 ./run_simple.sh --adam-head-lr 0.002 --adam-embed-lr 0.2
 ```
 
+Add linear LR warmup:
+
+```bash
+./run_simple.sh --warmup-frac 0.05
+```
+
 Try a different model size:
 
 ```bash
@@ -86,8 +92,13 @@ Combine architecture and optimizer changes:
 Because the arguments are normal CLI flags, you can compose them freely:
 
 ```bash
-./run_simple.sh --num-layers 6 --model-dim 384 --adam-head-lr 1e-3 --adam-weight-decay 0.1
+./run_simple.sh --num-layers 6 --model-dim 384 --adam-head-lr 1e-3 --adam-weight-decay 0.1 --warmup-frac 0.05
 ```
+
+Learning-rate schedule notes:
+- `--warmup-frac` linearly ramps each optimizer group for `int(train_steps * warmup_frac)` updates; for example `0.05` means the first 5% of optimizer steps
+- `--cooldown-frac` keeps the existing linear cooldown over the final fraction of training
+- `--warmup-frac + --cooldown-frac` must not exceed `1`, so warmup, plateau, and cooldown stay non-overlapping
 
 ## First-Time Setup
 
