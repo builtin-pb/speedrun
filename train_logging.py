@@ -80,6 +80,10 @@ def tensor_metrics_to_floats(metric_tensors: dict[str, torch.Tensor]) -> dict[st
     return {key: float(value) for key, value in zip(keys, values)}
 
 
+def _rms_from_vector_norm(norm: torch.Tensor, count: int) -> torch.Tensor:
+    return norm.float() / math.sqrt(max(count, 1))
+
+
 def parameter_metric_name(name: str, kind: str) -> str:
     if name == "embed.weight":
         return f"matrix_embed/{kind}"
@@ -104,8 +108,10 @@ def parameter_metric_name(name: str, kind: str) -> str:
 def collect_norm_metrics(model, *, include_matrix: bool) -> tuple[dict[str, float], dict[str, float]]:
     device = next(model.parameters()).device
     zero = lambda: torch.zeros((), device=device, dtype=torch.float32)
-    global_grad_sq = zero()
-    global_param_sq = zero()
+    global_grad_sumsq = zero()
+    global_param_sumsq = zero()
+    global_grad_count = zero()
+    global_param_count = zero()
     grad_nonfinite = zero()
     param_nonfinite = zero()
     grad_max_abs = zero()
@@ -116,12 +122,15 @@ def collect_norm_metrics(model, *, include_matrix: bool) -> tuple[dict[str, floa
         detached_param = param.detach()
         param_norm = torch.linalg.vector_norm(detached_param).float()
         param_sq = param_norm.square()
-        global_param_sq += param_sq
+        param_count = detached_param.new_tensor(detached_param.numel(), dtype=torch.float32)
+        param_rms = _rms_from_vector_norm(param_norm, detached_param.numel())
+        global_param_sumsq += param_sq
+        global_param_count += param_count
         param_nonfinite += (~torch.isfinite(detached_param)).sum()
         param_max_abs = torch.maximum(param_max_abs, detached_param.abs().amax().float())
 
         if include_matrix:
-            matrix_metrics[parameter_metric_name(name, "param_l2")] = param_norm
+            matrix_metrics[parameter_metric_name(name, "param_rms")] = param_rms
 
         if param.grad is None:
             continue
@@ -129,16 +138,19 @@ def collect_norm_metrics(model, *, include_matrix: bool) -> tuple[dict[str, floa
         detached_grad = param.grad.detach()
         grad_norm = torch.linalg.vector_norm(detached_grad).float()
         grad_sq = grad_norm.square()
-        global_grad_sq += grad_sq
+        grad_count = detached_grad.new_tensor(detached_grad.numel(), dtype=torch.float32)
+        grad_rms = _rms_from_vector_norm(grad_norm, detached_grad.numel())
+        global_grad_sumsq += grad_sq
+        global_grad_count += grad_count
         grad_nonfinite += (~torch.isfinite(detached_grad)).sum()
         grad_max_abs = torch.maximum(grad_max_abs, detached_grad.abs().amax().float())
 
         if include_matrix:
-            matrix_metrics[parameter_metric_name(name, "grad_l2")] = grad_norm
+            matrix_metrics[parameter_metric_name(name, "grad_rms")] = grad_rms
 
     main_metric_tensors = {
-        "main/global_grad_l2": global_grad_sq.sqrt(),
-        "main/global_param_l2": global_param_sq.sqrt(),
+        "main/global_grad_rms": (global_grad_sumsq / global_grad_count.clamp_min(1.0)).sqrt(),
+        "main/global_param_rms": (global_param_sumsq / global_param_count.clamp_min(1.0)).sqrt(),
         "main/grad_nonfinite_count": grad_nonfinite,
         "main/param_nonfinite_count": param_nonfinite,
         "main/grad_max_abs": grad_max_abs,
@@ -172,11 +184,12 @@ def log_static_model_metrics(run, print0, *, model) -> None:
     log_run_metrics(run, static_metrics)
 
 
-def _add_mean_l2(metric_tensors: dict[str, torch.Tensor], name: str, tensor: torch.Tensor) -> None:
-    norms = torch.linalg.vector_norm(tensor.detach().float(), dim=-1)
-    zero = torch.zeros((), device=norms.device, dtype=torch.float32)
-    metric_tensors[f"{name}__sum"] = metric_tensors.get(f"{name}__sum", zero) + norms.sum()
-    metric_tensors[f"{name}__count"] = metric_tensors.get(f"{name}__count", zero) + norms.new_tensor(norms.numel(), dtype=torch.float32)
+def _add_mean_rms(metric_tensors: dict[str, torch.Tensor], name: str, tensor: torch.Tensor) -> None:
+    detached = tensor.detach()
+    norm = torch.linalg.vector_norm(detached).float()
+    zero = torch.zeros((), device=norm.device, dtype=torch.float32)
+    metric_tensors[f"{name}__sumsq"] = metric_tensors.get(f"{name}__sumsq", zero) + norm.square()
+    metric_tensors[f"{name}__count"] = metric_tensors.get(f"{name}__count", zero) + norm.new_tensor(detached.numel(), dtype=torch.float32)
 
 
 def collect_stability_metrics(
@@ -194,7 +207,7 @@ def collect_stability_metrics(
     saturation_threshold = softcap * 0.95 / math.sqrt(1 - 0.95**2)
 
     def observe(name: str, tensor: torch.Tensor) -> None:
-        _add_mean_l2(metric_tensors, name, tensor)
+        _add_mean_rms(metric_tensors, name, tensor)
 
     with torch.inference_mode():
         for offset in range(0, sample_count, micro_batch_size):
@@ -228,11 +241,11 @@ def collect_stability_metrics(
     finalized["main/stability_sample_sequences_per_rank"] = float(sample_count)
     finalized["main/stability_sample_tokens_per_rank"] = float(sample_count * seq_len)
     finalized["main/stability_sample_fraction_per_rank"] = float(sample_count / max(len(inputs), 1))
-    mean_metric_names = sorted(key.removesuffix("__sum") for key in reduced_sums if key.endswith("__sum"))
+    mean_metric_names = sorted(key.removesuffix("__sumsq") for key in reduced_sums if key.endswith("__sumsq"))
     for key in mean_metric_names:
-        total_sum = reduced_sums[f"{key}__sum"]
+        total_sum = reduced_sums[f"{key}__sumsq"]
         total_count = reduced_sums[f"{key}__count"].clamp_min(1.0)
-        finalized[key] = float((total_sum / total_count).cpu().item())
+        finalized[key] = float((total_sum / total_count).sqrt().cpu().item())
 
     logits_count = reduced_sums["logits/count"].clamp_min(1.0)
     logits_mean = reduced_sums["logits/sum"] / logits_count

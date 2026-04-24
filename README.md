@@ -130,11 +130,13 @@ Training also logs to W&B by default. The dashboard is organized into:
 - `main/*` for high-signal run health and throughput metrics
 - `logits/*` for sampled logits and softcap diagnostics; defaults sample 1 sequence per rank and can be changed with `--stability-sample-sequences`
 - `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, `matrix_embed/*`, and `matrix_lm_head/*` for parameter-type diagnostics
-- `layer_embed/*`, `layer_attn/*`, `layer_mlp/*`, and `layer_final/*` for sampled layer-level diagnostics that are not already captured by matrix norms
+- `layer_embed/*`, `layer_attn/*`, `layer_mlp/*`, and `layer_final/*` for sampled layer-level RMS diagnostics that are complementary to the matrix parameter/gradient metrics
 
 ### W&B Metric Reference
 
 All metrics use `step` as their W&B x-axis unless noted otherwise. Metrics with `block_XX` repeat once for each transformer block.
+
+Compatibility note: the layer, matrix, and global magnitude metrics were renamed from `*_l2` to `*_rms`. Existing W&B dashboards or alerts keyed to the old names need to be updated, and old/new runs are not numerically comparable without accounting for the metric definition change.
 
 Run/index metrics:
 - `step`
@@ -155,8 +157,8 @@ Main run metrics:
 - `main/lr_muon`
 - `main/model_num_params`
 - `main/model_param_bytes`
-- `main/global_grad_l2`
-- `main/global_param_l2`
+- `main/global_grad_rms`
+- `main/global_param_rms`
 - `main/grad_nonfinite_count`
 - `main/param_nonfinite_count`
 - `main/grad_max_abs`
@@ -176,34 +178,34 @@ Sampled logits metrics:
 - `logits/softcap_positive_saturation_frac`
 - `logits/softcap_negative_saturation_frac`
 
-Matrix norm metrics:
-- `matrix_embed/param_l2`
-- `matrix_embed/grad_l2`
-- `matrix_lm_head/param_l2`
-- `matrix_lm_head/grad_l2`
-- `matrix_attn_q/block_XX_param_l2`
-- `matrix_attn_q/block_XX_grad_l2`
-- `matrix_attn_k/block_XX_param_l2`
-- `matrix_attn_k/block_XX_grad_l2`
-- `matrix_attn_v/block_XX_param_l2`
-- `matrix_attn_v/block_XX_grad_l2`
-- `matrix_attn_proj/block_XX_param_l2`
-- `matrix_attn_proj/block_XX_grad_l2`
-- `matrix_mlp_fc/block_XX_param_l2`
-- `matrix_mlp_fc/block_XX_grad_l2`
-- `matrix_mlp_proj/block_XX_param_l2`
-- `matrix_mlp_proj/block_XX_grad_l2`
+Matrix RMS metrics:
+- `matrix_embed/param_rms`
+- `matrix_embed/grad_rms`
+- `matrix_lm_head/param_rms`
+- `matrix_lm_head/grad_rms`
+- `matrix_attn_q/block_XX_param_rms`
+- `matrix_attn_q/block_XX_grad_rms`
+- `matrix_attn_k/block_XX_param_rms`
+- `matrix_attn_k/block_XX_grad_rms`
+- `matrix_attn_v/block_XX_param_rms`
+- `matrix_attn_v/block_XX_grad_rms`
+- `matrix_attn_proj/block_XX_param_rms`
+- `matrix_attn_proj/block_XX_grad_rms`
+- `matrix_mlp_fc/block_XX_param_rms`
+- `matrix_mlp_fc/block_XX_grad_rms`
+- `matrix_mlp_proj/block_XX_param_rms`
+- `matrix_mlp_proj/block_XX_grad_rms`
 - `matrix_other/*` for future parameters that do not match a known matrix group
 
 Sampled layer metrics:
-- `layer_embed/activation_l2`
-- `layer_attn/block_XX_input_l2`
-- `layer_attn/block_XX_update_l2`
-- `layer_attn/block_XX_output_l2`
-- `layer_mlp/block_XX_input_l2`
-- `layer_mlp/block_XX_update_l2`
-- `layer_mlp/block_XX_output_l2`
-- `layer_final/residual_l2`
+- `layer_embed/activation_rms`
+- `layer_attn/block_XX_input_rms`
+- `layer_attn/block_XX_update_rms`
+- `layer_attn/block_XX_output_rms`
+- `layer_mlp/block_XX_input_rms`
+- `layer_mlp/block_XX_update_rms`
+- `layer_mlp/block_XX_output_rms`
+- `layer_final/residual_rms`
 
 ## Repo Direction
 

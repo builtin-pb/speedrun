@@ -112,20 +112,20 @@ class Block(nn.Module):
     def forward(self, x: Tensor, observer: Callable[[str, Tensor], None] | None = None, block_idx: int | None = None) -> Tensor:
         if observer is not None:
             assert block_idx is not None
-            observer(f"layer_attn/block_{block_idx:02d}_input_l2", x)
+            observer(f"layer_attn/block_{block_idx:02d}_input_rms", x)
         attn_out = self.attn(norm(x))
         if observer is not None:
-            observer(f"layer_attn/block_{block_idx:02d}_update_l2", attn_out)
+            observer(f"layer_attn/block_{block_idx:02d}_update_rms", attn_out)
         x = x + attn_out
         if observer is not None:
-            observer(f"layer_attn/block_{block_idx:02d}_output_l2", x)
-            observer(f"layer_mlp/block_{block_idx:02d}_input_l2", x)
+            observer(f"layer_attn/block_{block_idx:02d}_output_rms", x)
+            observer(f"layer_mlp/block_{block_idx:02d}_input_rms", x)
         mlp_out = self.mlp(norm(x))
         if observer is not None:
-            observer(f"layer_mlp/block_{block_idx:02d}_update_l2", mlp_out)
+            observer(f"layer_mlp/block_{block_idx:02d}_update_rms", mlp_out)
         x = x + mlp_out
         if observer is not None:
-            observer(f"layer_mlp/block_{block_idx:02d}_output_l2", x)
+            observer(f"layer_mlp/block_{block_idx:02d}_output_rms", x)
         return x
 
 
@@ -140,11 +140,11 @@ class GPT(nn.Module):
     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
         x = norm(self.embed(inputs))
         if observer is not None:
-            observer("layer_embed/activation_l2", x)
+            observer("layer_embed/activation_rms", x)
         for block_idx, block in enumerate(self.blocks):
             x = block(x, observer=observer, block_idx=block_idx)
         if observer is not None:
-            observer("layer_final/residual_l2", x)
+            observer("layer_final/residual_rms", x)
         return self.proj(norm(x)).float()
 
     def forward(self, inputs: Tensor, targets: Tensor) -> Tensor:
