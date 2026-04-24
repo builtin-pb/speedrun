@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from collections.abc import Callable
+import math
 
 import torch
 from torch import Tensor, nn
@@ -22,12 +23,23 @@ def norm(x: Tensor) -> Tensor:
     return F.rms_norm(x, (x.size(-1),))
 
 
+def spectral_init_std(in_features: int, out_features: int) -> float:
+    return math.sqrt(out_features / in_features) / (math.sqrt(in_features) + math.sqrt(out_features))
+
+
 class Linear(nn.Linear):
     def __init__(self, in_features: int, out_features: int):
         super().__init__(in_features, out_features, bias=False)
+        nn.init.normal_(self.weight, mean=0.0, std=spectral_init_std(in_features, out_features))
 
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(x, self.weight.bfloat16())
+
+
+class LMHead(Linear):
+    def __init__(self, model_dim: int, vocab_size: int):
+        super().__init__(model_dim, vocab_size)
+        nn.init.normal_(self.weight, mean=0.0, std=1 / model_dim)
 
 
 class Rotary(nn.Module):
@@ -134,8 +146,9 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.model_dim).bfloat16()
+        nn.init.normal_(self.embed.weight, mean=0.0, std=1.0)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
-        self.proj = Linear(config.model_dim, config.vocab_size)
+        self.proj = LMHead(config.model_dim, config.vocab_size)
 
     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
         x = norm(self.embed(inputs))
