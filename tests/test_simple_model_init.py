@@ -38,3 +38,24 @@ class SimpleModelInitializationTests(unittest.TestCase):
         self.assertAlmostEqual(mlp_proj_std, spectral_std(1024, 256, scale=0.5), delta=0.002)
         self.assertAlmostEqual(lm_head_std, 1 / config.model_dim, delta=0.0005)
         self.assertAlmostEqual(embed_std, 1.0, delta=0.05)
+
+    def test_forward_and_none_residual_depth_scale_do_not_scale_initialization(self) -> None:
+        for mode in ("forward", "none"):
+            with self.subTest(mode=mode):
+                torch.manual_seed(0)
+                config = GPTConfig(
+                    vocab_size=4096,
+                    num_layers=4,
+                    model_dim=256,
+                    head_dim=64,
+                    mlp_expansion=4,
+                    residual_depth_scale=mode,
+                )
+
+                model = GPT(config)
+
+                attn_proj_std = float(model.blocks[0].attn.proj.weight.float().std(unbiased=False).item())
+                mlp_proj_std = float(model.blocks[0].mlp.proj.weight.float().std(unbiased=False).item())
+
+                self.assertAlmostEqual(attn_proj_std, spectral_std(256, 256), delta=0.003)
+                self.assertAlmostEqual(mlp_proj_std, spectral_std(1024, 256), delta=0.003)

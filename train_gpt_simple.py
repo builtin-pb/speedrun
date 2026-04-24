@@ -48,6 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-dim", type=int, default=768)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--mlp-expansion", type=int, default=4)
+    parser.add_argument("--layer-norm-position", choices=("pre", "post"), default="pre", help="Use pre-norm or post-norm transformer blocks.")
+    parser.add_argument(
+        "--residual-depth-scale",
+        choices=("none", "init", "forward"),
+        default="init",
+        help="Apply 1/sqrt(depth) residual scaling never, during residual projection init, or during forward residual updates.",
+    )
     parser.add_argument("--rope-base", type=float, default=1024.0)
     parser.add_argument("--attention-scale", type=float, default=0.12)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
@@ -223,19 +230,27 @@ def distributed_data_generator(
         yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
 
 
-def build_model(args: argparse.Namespace) -> GPT:
-    from simple_model import GPT, GPTConfig
+def build_gpt_config(args: argparse.Namespace):
+    from simple_model import GPTConfig
 
-    config = GPTConfig(
+    return GPTConfig(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
         head_dim=args.head_dim,
         mlp_expansion=args.mlp_expansion,
+        layer_norm_position=args.layer_norm_position,
+        residual_depth_scale=args.residual_depth_scale,
         rope_base=args.rope_base,
         attention_scale=args.attention_scale,
         logit_softcap=args.logit_softcap,
     )
+
+
+def build_model(args: argparse.Namespace) -> GPT:
+    from simple_model import GPT
+
+    config = build_gpt_config(args)
     model = GPT(config).cuda()
     if args.compile:
         model.compile(dynamic=False)

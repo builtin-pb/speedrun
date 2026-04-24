@@ -17,6 +17,14 @@ class GPTConfig:
     rope_base: float = 1024.0
     attention_scale: float = 0.12
     logit_softcap: float = 15.0
+    layer_norm_position: str = "pre"
+    residual_depth_scale: str = "init"
+
+    def __post_init__(self) -> None:
+        if self.layer_norm_position not in {"pre", "post"}:
+            raise ValueError(f"layer_norm_position must be 'pre' or 'post', got {self.layer_norm_position!r}")
+        if self.residual_depth_scale not in {"none", "init", "forward"}:
+            raise ValueError(f"residual_depth_scale must be 'none', 'init', or 'forward', got {self.residual_depth_scale!r}")
 
 
 def norm(x: Tensor) -> Tensor:
@@ -29,6 +37,10 @@ def spectral_init_std(in_features: int, out_features: int, *, scale: float = 1.0
 
 def residual_proj_init_scale(*, num_layers: int) -> float:
     return 1.0 / math.sqrt(num_layers)
+
+
+def residual_update_scale(*, num_layers: int, residual_depth_scale: str) -> float:
+    return residual_proj_init_scale(num_layers=num_layers) if residual_depth_scale == "forward" else 1.0
 
 
 def lm_head_init_std(*, model_dim: int) -> float:
@@ -156,7 +168,12 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
-        proj_init_scale = residual_proj_init_scale(num_layers=config.num_layers)
+        self.layer_norm_position = config.layer_norm_position
+        self.residual_update_scale = residual_update_scale(
+            num_layers=config.num_layers,
+            residual_depth_scale=config.residual_depth_scale,
+        )
+        proj_init_scale = residual_proj_init_scale(num_layers=config.num_layers) if config.residual_depth_scale == "init" else 1.0
         self.attn = CausalSelfAttention(
             config.model_dim,
             head_dim=config.head_dim,
@@ -174,17 +191,25 @@ class Block(nn.Module):
         if observer is not None:
             assert block_idx is not None
             observer(f"layer_attn/block_{block_idx:02d}_input_rms", x)
-        attn_out = self.attn(norm(x), observer=observer, block_idx=block_idx)
+        attn_in = norm(x) if self.layer_norm_position == "pre" else x
+        attn_out = self.attn(attn_in, observer=observer, block_idx=block_idx)
+        attn_update = self.residual_update_scale * attn_out
         if observer is not None:
-            observer(f"layer_attn/block_{block_idx:02d}_update_rms", attn_out)
-        x = x + attn_out
+            observer(f"layer_attn/block_{block_idx:02d}_update_rms", attn_update)
+        x = x + attn_update
+        if self.layer_norm_position == "post":
+            x = norm(x)
         if observer is not None:
             observer(f"layer_attn/block_{block_idx:02d}_output_rms", x)
             observer(f"layer_mlp/block_{block_idx:02d}_input_rms", x)
-        mlp_out = self.mlp(norm(x), observer=observer, block_idx=block_idx)
+        mlp_in = norm(x) if self.layer_norm_position == "pre" else x
+        mlp_out = self.mlp(mlp_in, observer=observer, block_idx=block_idx)
+        mlp_update = self.residual_update_scale * mlp_out
         if observer is not None:
-            observer(f"layer_mlp/block_{block_idx:02d}_update_rms", mlp_out)
-        x = x + mlp_out
+            observer(f"layer_mlp/block_{block_idx:02d}_update_rms", mlp_update)
+        x = x + mlp_update
+        if self.layer_norm_position == "post":
+            x = norm(x)
         if observer is not None:
             observer(f"layer_mlp/block_{block_idx:02d}_output_rms", x)
         return x

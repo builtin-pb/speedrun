@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from simple_model import lm_head_init_std, residual_proj_init_scale, spectral_init_std
+from simple_model import lm_head_init_std, residual_proj_init_scale, residual_update_scale, spectral_init_std
 
 
 class InitPolicyTests(unittest.TestCase):
@@ -12,6 +12,11 @@ class InitPolicyTests(unittest.TestCase):
 
     def test_residual_proj_init_scale_divides_by_sqrt_depth(self) -> None:
         self.assertAlmostEqual(residual_proj_init_scale(num_layers=16), 0.25)
+
+    def test_residual_update_scale_only_applies_for_forward_mode(self) -> None:
+        self.assertAlmostEqual(residual_update_scale(num_layers=16, residual_depth_scale="forward"), 0.25)
+        self.assertEqual(residual_update_scale(num_layers=16, residual_depth_scale="init"), 1.0)
+        self.assertEqual(residual_update_scale(num_layers=16, residual_depth_scale="none"), 1.0)
 
     def test_lm_head_init_std_matches_mup_default(self) -> None:
         self.assertAlmostEqual(lm_head_init_std(model_dim=256), 1 / 256)
