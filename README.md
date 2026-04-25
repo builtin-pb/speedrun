@@ -142,7 +142,7 @@ There is a starter notes stub in [experiments/README.md](experiments/README.md).
 Training also logs to W&B by default. The dashboard is organized into:
 - `main/*` for high-signal run health and throughput metrics
 - `logits/*` for sampled logits and softcap diagnostics; defaults sample 1 sequence per rank and can be changed with `--stability-sample-sequences`
-- `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, and `matrix_embed/*` for matrix diagnostics, including parameter RMS, gradient RMS, and sampled activation-tail summaries
+- `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_gate/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, and `matrix_embed/*` for matrix diagnostics, including parameter RMS, gradient RMS, and sampled activation-tail summaries
 - `matrix_lm_head/*` for LM-head parameter and gradient diagnostics
 - `layer_embed/*`, `layer_attn/*`, `layer_mlp/*`, and `layer_final/*` for sampled layer-level RMS diagnostics that are complementary to the matrix parameter/gradient metrics
 
@@ -223,6 +223,11 @@ Matrix metrics:
 - `matrix_attn_proj/block_XX_act_abs_p50`
 - `matrix_attn_proj/block_XX_act_abs_p90`
 - `matrix_attn_proj/block_XX_act_abs_p99`
+- `matrix_mlp_gate/block_XX_param_rms`
+- `matrix_mlp_gate/block_XX_grad_rms`
+- `matrix_mlp_gate/block_XX_act_abs_p50`
+- `matrix_mlp_gate/block_XX_act_abs_p90`
+- `matrix_mlp_gate/block_XX_act_abs_p99`
 - `matrix_mlp_fc/block_XX_param_rms`
 - `matrix_mlp_fc/block_XX_grad_rms`
 - `matrix_mlp_fc/block_XX_act_abs_p50`

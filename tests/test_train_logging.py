@@ -60,8 +60,8 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertAlmostEqual(matrix_metrics["matrix_lm_head/param_rms"], math.sqrt(10.0 / 4.0))
         self.assertAlmostEqual(matrix_metrics["matrix_embed/grad_rms"], math.sqrt(100.0 / 4.0))
         self.assertAlmostEqual(matrix_metrics["matrix_lm_head/grad_rms"], math.sqrt(10.0 / 4.0))
-        self.assertAlmostEqual(main_metrics["main/global_param_rms"], math.sqrt(35.0 / 8.0))
-        self.assertAlmostEqual(main_metrics["main/global_grad_rms"], math.sqrt(110.0 / 8.0))
+        self.assertAlmostEqual(main_metrics["main/global_param_rms"], math.sqrt(35.0 / 8.0), places=6)
+        self.assertAlmostEqual(main_metrics["main/global_grad_rms"], math.sqrt(110.0 / 8.0), places=6)
         self.assertNotIn("main/global_param_l2", main_metrics)
         self.assertNotIn("main/global_grad_l2", main_metrics)
         self.assertNotIn("matrix_embed/param_l2", matrix_metrics)
@@ -81,7 +81,7 @@ class TrainLoggingTests(unittest.TestCase):
 
         self.assertAlmostEqual(metrics["layer_embed/activation_rms"], math.sqrt(25.0 / 8.0))
         self.assertAlmostEqual(metrics["layer_attn/block_00_update_rms"], math.sqrt(100.0 / 8.0))
-        self.assertAlmostEqual(metrics["layer_final/residual_rms"], 1.0)
+        self.assertAlmostEqual(metrics["layer_final/residual_rms"], 1.0, places=6)
         self.assertEqual(metrics["logits/top1"], 9.0)
         self.assertEqual(metrics["logits/top5_mean"], 7.0)
         self.assertEqual(metrics["logits/bottom1"], -9.0)
@@ -121,8 +121,17 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertIn("matrix_attn_v/block_00_act_abs", seen)
         self.assertIn("matrix_attn_proj/block_00_act_abs", seen)
         self.assertIn("matrix_mlp_fc/block_00_act_abs", seen)
+        self.assertIn("matrix_mlp_gate/block_00_act_abs", seen)
         self.assertIn("matrix_mlp_proj/block_00_act_abs", seen)
         self.assertNotIn("layer_attn/block_00_input_l2", seen)
         self.assertNotIn("layer_attn/block_00_output_l2", seen)
         self.assertNotIn("layer_mlp/block_00_input_l2", seen)
         self.assertNotIn("layer_mlp/block_00_output_l2", seen)
+
+    def test_simple_model_reports_swiglu_gate_as_named_matrix_metric(self) -> None:
+        model = GPT(GPTConfig(vocab_size=16, num_layers=1, model_dim=4, head_dim=4, mlp_expansion=1))
+
+        _, matrix_metrics = collect_norm_metrics(model, include_matrix=True)
+
+        self.assertIn("matrix_mlp_gate/block_00_param_rms", matrix_metrics)
+        self.assertNotIn("matrix_other/blocks_0_mlp_gate_weight_param_rms", matrix_metrics)

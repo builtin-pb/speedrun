@@ -132,7 +132,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim: int, expansion: int, *, proj_init_scale: float):
         super().__init__()
-        hdim = expansion * dim
+        hdim = round((2 * expansion * dim) / 3)
+        self.gate = Linear(dim, hdim)
         self.fc = Linear(dim, hdim)
         self.proj = Linear(hdim, dim, init_scale=proj_init_scale)
 
@@ -142,11 +143,13 @@ class MLP(nn.Module):
         observer: Callable[[str, Tensor], None] | None = None,
         block_idx: int | None = None,
     ) -> Tensor:
+        gate = self.gate(x)
         x = self.fc(x)
         if observer is not None:
             assert block_idx is not None
+            observer(f"matrix_mlp_gate/block_{block_idx:02d}_act_abs", gate)
             observer(f"matrix_mlp_fc/block_{block_idx:02d}_act_abs", x)
-        x = F.relu(x).square()
+        x = F.silu(gate) * x
         x = self.proj(x)
         if observer is not None:
             observer(f"matrix_mlp_proj/block_{block_idx:02d}_act_abs", x)

@@ -54,6 +54,7 @@ def setup_wandb(args, print0, *, rank: int):
         "matrix_attn_k",
         "matrix_attn_v",
         "matrix_attn_proj",
+        "matrix_mlp_gate",
         "matrix_mlp_fc",
         "matrix_mlp_proj",
         "matrix_embed",
@@ -99,7 +100,7 @@ def parameter_metric_name(name: str, kind: str) -> str:
             metric_name = f"{block_label}_{kind}" if metric_group != "matrix_other" else f"{name.replace('.', '_')}_{kind}"
             return f"{metric_group}/{metric_name}"
         if parts[2] == "mlp":
-            mapping = {"fc": "matrix_mlp_fc", "proj": "matrix_mlp_proj"}
+            mapping = {"gate": "matrix_mlp_gate", "fc": "matrix_mlp_fc", "proj": "matrix_mlp_proj"}
             metric_group = mapping.get(parts[3], "matrix_other")
             metric_name = f"{block_label}_{kind}" if metric_group != "matrix_other" else f"{name.replace('.', '_')}_{kind}"
             return f"{metric_group}/{metric_name}"
