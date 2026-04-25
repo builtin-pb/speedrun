@@ -237,6 +237,8 @@ class Block(nn.Module):
             observer(f"layer_attn/block_{block_idx:02d}_input_rms", x)
         attn_input = norm(x) if self.layer_norm_position == "pre" else x
         attn_gate = self.compute_residual_gate(x, getattr(self, "attn_residual_gate", None))
+        if observer is not None:
+            observer(f"gate_coeff_attn/block_{block_idx:02d}", attn_gate)
         attn_out = self.attn(attn_input, observer=observer, block_idx=block_idx)
         attn_update = self.residual_scale * attn_gate * attn_out
         if observer is not None:
@@ -248,6 +250,8 @@ class Block(nn.Module):
             observer(f"layer_attn/block_{block_idx:02d}_output_rms", x)
             observer(f"layer_mlp/block_{block_idx:02d}_input_rms", x)
         mlp_gate = self.compute_residual_gate(x, getattr(self, "mlp_residual_gate", None))
+        if observer is not None:
+            observer(f"gate_coeff_mlp/block_{block_idx:02d}", mlp_gate)
         mlp_input = norm(x) if self.layer_norm_position == "pre" else x
         mlp_out = self.mlp(mlp_input, observer=observer, block_idx=block_idx)
         mlp_update = self.residual_scale * mlp_gate * mlp_out

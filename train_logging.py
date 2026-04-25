@@ -58,6 +58,12 @@ def setup_wandb(args, print0, *, rank: int):
         "matrix_mlp_proj",
         "matrix_embed",
         "matrix_lm_head",
+        "gate_trunk",
+        "gate_attn_head",
+        "gate_mlp_head",
+        "gate_coeff_attn",
+        "gate_coeff_mlp",
+        "gate_coeff_summary",
         "matrix_other",
     ]:
         run.define_metric(f"{metric_group}/*", step_metric="step")
@@ -93,6 +99,11 @@ def parameter_metric_name(name: str, kind: str) -> str:
     parts = name.split(".")
     if len(parts) >= 4 and parts[0] == "blocks":
         block_label = f"block_{int(parts[1]):02d}"
+        if parts[2] == "residual_gate_in" and parts[3] == "weight":
+            return f"gate_trunk/{block_label}_{kind}"
+        if parts[2] in {"attn_residual_gate", "mlp_residual_gate"} and parts[3] in {"weight", "bias"}:
+            gate_group = "gate_attn_head" if parts[2] == "attn_residual_gate" else "gate_mlp_head"
+            return f"{gate_group}/{block_label}_{parts[3]}_{kind}"
         if parts[2] == "attn":
             mapping = {"q": "matrix_attn_q", "k": "matrix_attn_k", "v": "matrix_attn_v", "proj": "matrix_attn_proj"}
             metric_group = mapping.get(parts[3], "matrix_other")
@@ -193,6 +204,34 @@ def _add_mean_rms(metric_tensors: dict[str, torch.Tensor], name: str, tensor: to
     metric_tensors[f"{name}__count"] = metric_tensors.get(f"{name}__count", zero) + norm.new_tensor(detached.numel(), dtype=torch.float32)
 
 
+def _add_gate_coefficient_stats(
+    gate_tensors: dict[str, torch.Tensor],
+    gate_mins: dict[str, torch.Tensor],
+    gate_maxes: dict[str, torch.Tensor],
+    name: str,
+    tensor: torch.Tensor,
+) -> None:
+    detached = tensor.detach().float()
+    zero = torch.zeros((), device=detached.device, dtype=torch.float32)
+    gate_tensors[f"{name}__sum"] = gate_tensors.get(f"{name}__sum", zero) + detached.sum()
+    gate_tensors[f"{name}__sumsq"] = gate_tensors.get(f"{name}__sumsq", zero) + detached.square().sum()
+    gate_tensors[f"{name}__count"] = gate_tensors.get(f"{name}__count", zero) + detached.new_tensor(detached.numel(), dtype=torch.float32)
+    gate_tensors[f"{name}__delta_abs_sum"] = gate_tensors.get(f"{name}__delta_abs_sum", zero) + (detached - 1.0).abs().sum()
+
+    local_min = detached.amin()
+    local_max = detached.amax()
+    gate_mins[name] = local_min if name not in gate_mins else torch.minimum(gate_mins[name], local_min)
+    gate_maxes[name] = local_max if name not in gate_maxes else torch.maximum(gate_maxes[name], local_max)
+
+
+def _gate_summary_name(name: str) -> str | None:
+    if name.startswith("gate_coeff_attn/"):
+        return "gate_coeff_summary/attn"
+    if name.startswith("gate_coeff_mlp/"):
+        return "gate_coeff_summary/mlp"
+    return None
+
+
 def activation_quantile_metric_names(base_name: str) -> dict[str, str]:
     return {
         "p50": f"{base_name}_p50",
@@ -240,6 +279,15 @@ def _all_reduce_if_initialized(tensor: torch.Tensor, *, op) -> None:
         dist.all_reduce(tensor, op=op)
 
 
+def _reduce_tensor_dict(metric_tensors: dict[str, torch.Tensor], *, op) -> dict[str, torch.Tensor]:
+    if not metric_tensors:
+        return {}
+    keys = sorted(metric_tensors)
+    values = torch.stack([metric_tensors[key].detach().to(dtype=torch.float32) for key in keys])
+    _all_reduce_if_initialized(values, op=op)
+    return {key: value for key, value in zip(keys, values)}
+
+
 def _gather_object_if_initialized(local_value, *, rank: int):
     world_size = _distributed_world_size()
     if world_size == 1:
@@ -258,6 +306,9 @@ def collect_stability_metrics(
     rank: int,
 ) -> dict[str, float]:
     metric_tensors: dict[str, torch.Tensor] = {}
+    gate_tensors: dict[str, torch.Tensor] = {}
+    gate_mins: dict[str, torch.Tensor] = {}
+    gate_maxes: dict[str, torch.Tensor] = {}
     abs_samples: dict[str, list[torch.Tensor]] = {}
     softcap = model.config.logit_softcap
     sample_count = min(len(inputs), max_sequences)
@@ -269,6 +320,12 @@ def collect_stability_metrics(
     def observe(name: str, tensor: torch.Tensor) -> None:
         if name.startswith("matrix_"):
             abs_samples.setdefault(name, []).append(_sample_abs_values(tensor))
+            return
+        if name.startswith("gate_coeff_"):
+            _add_gate_coefficient_stats(gate_tensors, gate_mins, gate_maxes, name, tensor)
+            summary_name = _gate_summary_name(name)
+            if summary_name is not None:
+                _add_gate_coefficient_stats(gate_tensors, gate_mins, gate_maxes, summary_name, tensor)
             return
         _add_mean_rms(metric_tensors, name, tensor)
 
@@ -291,10 +348,10 @@ def collect_stability_metrics(
     if not metric_tensors:
         return {}
 
-    sum_keys = sorted(metric_tensors)
-    reduced_sum_values = torch.stack([metric_tensors[key].detach().to(dtype=torch.float32) for key in sum_keys])
-    _all_reduce_if_initialized(reduced_sum_values, op=dist.ReduceOp.SUM)
-    reduced_sums = {key: value for key, value in zip(sum_keys, reduced_sum_values)}
+    reduced_sums = _reduce_tensor_dict(metric_tensors, op=dist.ReduceOp.SUM)
+    reduced_gate_sums = _reduce_tensor_dict(gate_tensors, op=dist.ReduceOp.SUM)
+    reduced_gate_mins = _reduce_tensor_dict(gate_mins, op=dist.ReduceOp.MIN)
+    reduced_gate_maxes = _reduce_tensor_dict(gate_maxes, op=dist.ReduceOp.MAX)
 
     local_abs_samples = {
         name: torch.cat(values) if len(values) > 1 else values[0]
@@ -316,6 +373,17 @@ def collect_stability_metrics(
         total_sum = reduced_sums[f"{key}__sumsq"]
         total_count = reduced_sums[f"{key}__count"].clamp_min(1.0)
         finalized[key] = float((total_sum / total_count).sqrt().cpu().item())
+    gate_metric_names = sorted(key.removesuffix("__sum") for key in reduced_gate_sums if key.endswith("__sum"))
+    for key in gate_metric_names:
+        count = reduced_gate_sums[f"{key}__count"].clamp_min(1.0)
+        mean = reduced_gate_sums[f"{key}__sum"] / count
+        variance = reduced_gate_sums[f"{key}__sumsq"] / count - mean.square()
+        delta_abs_mean = reduced_gate_sums[f"{key}__delta_abs_sum"] / count
+        finalized[f"{key}_mean"] = float(mean.cpu().item())
+        finalized[f"{key}_std"] = float(variance.clamp_min(0.0).sqrt().cpu().item())
+        finalized[f"{key}_min"] = float(reduced_gate_mins[key].cpu().item())
+        finalized[f"{key}_max"] = float(reduced_gate_maxes[key].cpu().item())
+        finalized[f"{key}_delta_abs_mean"] = float(delta_abs_mean.cpu().item())
 
     logits_count = reduced_sums["logits/count"].clamp_min(1.0)
     logits_mean = reduced_sums["logits/sum"] / logits_count

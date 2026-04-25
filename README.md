@@ -144,6 +144,8 @@ Training also logs to W&B by default. The dashboard is organized into:
 - `logits/*` for sampled logits and softcap diagnostics; defaults sample 1 sequence per rank and can be changed with `--stability-sample-sequences`
 - `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, and `matrix_embed/*` for matrix diagnostics, including parameter RMS, gradient RMS, and sampled activation-tail summaries
 - `matrix_lm_head/*` for LM-head parameter and gradient diagnostics
+- `gate_trunk/*`, `gate_attn_head/*`, and `gate_mlp_head/*` for residual-gate parameter and gradient RMS diagnostics
+- `gate_coeff_attn/*`, `gate_coeff_mlp/*`, and `gate_coeff_summary/*` for sampled residual-gate coefficient statistics over time and across layers
 - `layer_embed/*`, `layer_attn/*`, `layer_mlp/*`, and `layer_final/*` for sampled layer-level RMS diagnostics that are complementary to the matrix parameter/gradient metrics
 
 ### W&B Metric Reference
@@ -236,6 +238,40 @@ Matrix metrics:
 - `matrix_other/*` for future parameters that do not match a known matrix group
 
 Activation-tail quantiles are computed on a random capped sample of absolute values per observed tensor during stability replay, not on every element.
+
+Gate metrics:
+- `gate_trunk/block_XX_param_rms`
+- `gate_trunk/block_XX_grad_rms`
+- `gate_attn_head/block_XX_weight_param_rms`
+- `gate_attn_head/block_XX_weight_grad_rms`
+- `gate_attn_head/block_XX_bias_param_rms`
+- `gate_attn_head/block_XX_bias_grad_rms`
+- `gate_mlp_head/block_XX_weight_param_rms`
+- `gate_mlp_head/block_XX_weight_grad_rms`
+- `gate_mlp_head/block_XX_bias_param_rms`
+- `gate_mlp_head/block_XX_bias_grad_rms`
+- `gate_coeff_attn/block_XX_mean`
+- `gate_coeff_attn/block_XX_std`
+- `gate_coeff_attn/block_XX_min`
+- `gate_coeff_attn/block_XX_max`
+- `gate_coeff_attn/block_XX_delta_abs_mean`
+- `gate_coeff_mlp/block_XX_mean`
+- `gate_coeff_mlp/block_XX_std`
+- `gate_coeff_mlp/block_XX_min`
+- `gate_coeff_mlp/block_XX_max`
+- `gate_coeff_mlp/block_XX_delta_abs_mean`
+- `gate_coeff_summary/attn_mean`
+- `gate_coeff_summary/attn_std`
+- `gate_coeff_summary/attn_min`
+- `gate_coeff_summary/attn_max`
+- `gate_coeff_summary/attn_delta_abs_mean`
+- `gate_coeff_summary/mlp_mean`
+- `gate_coeff_summary/mlp_std`
+- `gate_coeff_summary/mlp_min`
+- `gate_coeff_summary/mlp_max`
+- `gate_coeff_summary/mlp_delta_abs_mean`
+
+Gate parameter metrics are emitted with matrix diagnostics. Gate coefficient metrics are computed during stability replay on the sampled training sequences and summarize the actual multiplicative coefficients, where `1.0` is neutral and `delta_abs_mean` is the mean absolute movement away from neutral.
 
 Sampled layer metrics:
 - `layer_embed/activation_rms`
