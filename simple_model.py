@@ -17,6 +17,21 @@ class GPTConfig:
     rope_base: float = 1024.0
     attention_scale: float = 0.12
     logit_softcap: float = 15.0
+    layer_norm_position: str = "pre"
+    residual_depth_scale: str = "init"
+    learned_residual_gates: bool = False
+    gate_feature_dim: int = 16
+    gate_delta_scale: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.layer_norm_position not in {"pre", "post"}:
+            raise ValueError(f"layer_norm_position must be 'pre' or 'post', got {self.layer_norm_position!r}")
+        if self.residual_depth_scale not in {"init", "forward", "none"}:
+            raise ValueError(
+                f"residual_depth_scale must be 'init', 'forward', or 'none', got {self.residual_depth_scale!r}"
+            )
+        if not 0.0 < self.gate_delta_scale <= 1.0:
+            raise ValueError(f"gate_delta_scale must be in (0, 1], got {self.gate_delta_scale!r}")
 
 
 def norm(x: Tensor) -> Tensor:
@@ -27,7 +42,15 @@ def spectral_init_std(in_features: int, out_features: int, *, scale: float = 1.0
     return scale * math.sqrt(out_features / in_features) / (math.sqrt(in_features) + math.sqrt(out_features))
 
 
-def residual_proj_init_scale(*, num_layers: int) -> float:
+def residual_proj_init_scale(*, num_layers: int, residual_depth_scale: str = "init") -> float:
+    if residual_depth_scale != "init":
+        return 1.0
+    return 1.0 / math.sqrt(num_layers)
+
+
+def residual_forward_scale(*, num_layers: int, residual_depth_scale: str) -> float:
+    if residual_depth_scale != "forward":
+        return 1.0
     return 1.0 / math.sqrt(num_layers)
 
 
@@ -156,7 +179,34 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
-        proj_init_scale = residual_proj_init_scale(num_layers=config.num_layers)
+        proj_init_scale = residual_proj_init_scale(
+            num_layers=config.num_layers,
+            residual_depth_scale=config.residual_depth_scale,
+        )
+        self.layer_norm_position = config.layer_norm_position
+        self.residual_scale = residual_forward_scale(
+            num_layers=config.num_layers,
+            residual_depth_scale=config.residual_depth_scale,
+        )
+        if config.learned_residual_gates:
+            if config.gate_feature_dim <= 0:
+                raise ValueError(f"gate_feature_dim must be positive, got {config.gate_feature_dim}")
+            if config.gate_feature_dim > config.model_dim:
+                raise ValueError(f"gate_feature_dim must be <= model_dim, got {config.gate_feature_dim} and {config.model_dim}")
+            self.residual_gate_in = nn.Linear(config.model_dim, config.gate_feature_dim, bias=False)
+            nn.init.normal_(
+                self.residual_gate_in.weight,
+                mean=0.0,
+                std=spectral_init_std(config.model_dim, config.gate_feature_dim),
+            )
+            self.attn_residual_gate = nn.Linear(config.gate_feature_dim, 1)
+            self.mlp_residual_gate = nn.Linear(config.gate_feature_dim, 1)
+            nn.init.zeros_(self.attn_residual_gate.weight)
+            nn.init.zeros_(self.attn_residual_gate.bias)
+            nn.init.zeros_(self.mlp_residual_gate.weight)
+            nn.init.zeros_(self.mlp_residual_gate.bias)
+            self.gate_feature_dim = config.gate_feature_dim
+            self.gate_delta_scale = config.gate_delta_scale
         self.attn = CausalSelfAttention(
             config.model_dim,
             head_dim=config.head_dim,
@@ -170,21 +220,42 @@ class Block(nn.Module):
             proj_init_scale=proj_init_scale,
         )
 
+    def compute_residual_gate(self, x: Tensor, gate_proj: nn.Linear | None) -> Tensor:
+        if gate_proj is None or not hasattr(self, "residual_gate_in"):
+            return x.new_ones((*x.shape[:-1], 1))
+        gate_features = F.linear(norm(x), self.residual_gate_in.weight.to(dtype=x.dtype))
+        gate_logits = F.linear(
+            gate_features,
+            gate_proj.weight.to(dtype=x.dtype),
+            gate_proj.bias.to(dtype=x.dtype),
+        )
+        return 1.0 + self.gate_delta_scale * torch.tanh(gate_logits)
+
     def forward(self, x: Tensor, observer: Callable[[str, Tensor], None] | None = None, block_idx: int | None = None) -> Tensor:
         if observer is not None:
             assert block_idx is not None
             observer(f"layer_attn/block_{block_idx:02d}_input_rms", x)
-        attn_out = self.attn(norm(x), observer=observer, block_idx=block_idx)
+        attn_input = norm(x) if self.layer_norm_position == "pre" else x
+        attn_gate = self.compute_residual_gate(x, getattr(self, "attn_residual_gate", None))
+        attn_out = self.attn(attn_input, observer=observer, block_idx=block_idx)
+        attn_update = self.residual_scale * attn_gate * attn_out
         if observer is not None:
-            observer(f"layer_attn/block_{block_idx:02d}_update_rms", attn_out)
-        x = x + attn_out
+            observer(f"layer_attn/block_{block_idx:02d}_update_rms", attn_update)
+        x = x + attn_update
+        if self.layer_norm_position == "post":
+            x = norm(x)
         if observer is not None:
             observer(f"layer_attn/block_{block_idx:02d}_output_rms", x)
             observer(f"layer_mlp/block_{block_idx:02d}_input_rms", x)
-        mlp_out = self.mlp(norm(x), observer=observer, block_idx=block_idx)
+        mlp_gate = self.compute_residual_gate(x, getattr(self, "mlp_residual_gate", None))
+        mlp_input = norm(x) if self.layer_norm_position == "pre" else x
+        mlp_out = self.mlp(mlp_input, observer=observer, block_idx=block_idx)
+        mlp_update = self.residual_scale * mlp_gate * mlp_out
         if observer is not None:
-            observer(f"layer_mlp/block_{block_idx:02d}_update_rms", mlp_out)
-        x = x + mlp_out
+            observer(f"layer_mlp/block_{block_idx:02d}_update_rms", mlp_update)
+        x = x + mlp_update
+        if self.layer_norm_position == "post":
+            x = norm(x)
         if observer is not None:
             observer(f"layer_mlp/block_{block_idx:02d}_output_rms", x)
         return x

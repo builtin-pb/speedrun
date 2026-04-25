@@ -70,19 +70,76 @@ def build_optimizers(
     adam_beta2: float = 0.95,
     adam_eps: float = 1e-10,
     adam_weight_decay: float = 0.0,
+    gate_lr: float = 0.008,
+    gate_beta2: float = 0.99,
+    gate_weight_decay: float = 0.0,
+    gate_trunk_lr: float | None = None,
+    gate_trunk_beta2: float | None = None,
+    gate_trunk_weight_decay: float | None = None,
+    gate_bias_lr: float | None = None,
+    gate_bias_beta2: float | None = None,
+    gate_bias_weight_decay: float | None = None,
     muon_lr: float = 0.02,
     muon_weight_decay: float = 0.01,
     muon_momentum: float = 0.95,
     fused_adamw: bool = True,
 ) -> list[torch.optim.Optimizer]:
-    hidden_matrix_params = [param for param in model.blocks.parameters() if param.ndim >= 2]
+    hidden_matrix_params = [param for name, param in model.blocks.named_parameters() if param.ndim >= 2 and "residual_gate" not in name]
+    hidden_scalar_params = [param for name, param in model.blocks.named_parameters() if param.ndim < 2 and "residual_gate" not in name]
+    gate_trunk_params = [
+        param
+        for name, param in model.blocks.named_parameters()
+        if name.endswith("residual_gate_in.weight")
+    ]
+    gate_head_weight_params = [
+        param
+        for name, param in model.blocks.named_parameters()
+        if "residual_gate" in name and param.ndim >= 2 and not name.endswith("residual_gate_in.weight")
+    ]
+    gate_bias_params = [
+        param
+        for name, param in model.blocks.named_parameters()
+        if "residual_gate" in name and param.ndim < 2
+    ]
     embed_params = list(model.embed.parameters())
     head_params = [model.proj.weight]
 
     adam_param_groups = [
-        dict(params=head_params, lr=adam_head_lr),
-        dict(params=embed_params, lr=adam_embed_lr),
+        dict(params=head_params, lr=adam_head_lr, group_name="adam_head"),
+        dict(params=embed_params, lr=adam_embed_lr, group_name="adam_embed"),
     ]
+    if gate_trunk_params:
+        adam_param_groups.append(
+            dict(
+                params=gate_trunk_params,
+                lr=gate_lr if gate_trunk_lr is None else gate_trunk_lr,
+                weight_decay=gate_weight_decay if gate_trunk_weight_decay is None else gate_trunk_weight_decay,
+                betas=(adam_beta1, gate_beta2 if gate_trunk_beta2 is None else gate_trunk_beta2),
+                group_name="gate_trunk",
+            )
+        )
+    if gate_head_weight_params:
+        adam_param_groups.append(
+            dict(
+                params=gate_head_weight_params,
+                lr=gate_lr,
+                weight_decay=gate_weight_decay,
+                betas=(adam_beta1, gate_beta2),
+                group_name="gate_head",
+            )
+        )
+    if gate_bias_params:
+        adam_param_groups.append(
+            dict(
+                params=gate_bias_params,
+                lr=gate_lr if gate_bias_lr is None else gate_bias_lr,
+                weight_decay=gate_weight_decay if gate_bias_weight_decay is None else gate_bias_weight_decay,
+                betas=(adam_beta1, gate_beta2 if gate_bias_beta2 is None else gate_bias_beta2),
+                group_name="gate_bias",
+            )
+        )
+    if hidden_scalar_params:
+        adam_param_groups.append(dict(params=hidden_scalar_params, lr=adam_embed_lr, weight_decay=0.0, group_name="hidden_scalar"))
     adamw_kwargs = dict(
         betas=(adam_beta1, adam_beta2),
         eps=adam_eps,
@@ -92,6 +149,7 @@ def build_optimizers(
         adamw_kwargs["fused"] = True
     optimizer1 = torch.optim.AdamW(adam_param_groups, **adamw_kwargs)
     optimizer2 = Muon(hidden_matrix_params, lr=muon_lr, weight_decay=muon_weight_decay, momentum=muon_momentum)
+    optimizer2.param_groups[0]["group_name"] = "muon_hidden_matrix"
     optimizers = [optimizer1, optimizer2]
     for optimizer in optimizers:
         for group in optimizer.param_groups:

@@ -51,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rope-base", type=float, default=1024.0)
     parser.add_argument("--attention-scale", type=float, default=0.12)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
+    parser.add_argument("--learned-residual-gates", action="store_true", help="Learn one residual update scale for attention and MLP in each block.")
+    parser.add_argument("--gate-feature-dim", type=int, default=16, help="Width of the normalized residual slice used to predict attention/MLP gates.")
+    parser.add_argument("--gate-delta-scale", type=float, default=0.5, help="Maximum learned deviation of residual gates away from the baseline scale of 1.")
+    parser.add_argument("--gate-warmup-frac", type=float, default=None, help="Optional override for the gate-only linear warmup fraction.")
+    parser.add_argument("--gate-cooldown-frac", type=float, default=None, help="Optional override for the gate-only linear cooldown fraction.")
+    parser.add_argument("--gate-freeze-steps", type=int, default=0, help="Number of final training steps where gate learning rates are frozen to zero.")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--adam-head-lr", type=float, default=1 / 320)
@@ -59,6 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--adam-eps", type=float, default=1e-10)
     parser.add_argument("--adam-weight-decay", type=float, default=0.0)
+    parser.add_argument("--gate-lr", type=float, default=0.008)
+    parser.add_argument("--gate-beta2", type=float, default=0.99)
+    parser.add_argument("--gate-weight-decay", type=float, default=0.0)
+    parser.add_argument("--gate-trunk-lr", type=float, default=None, help="Optional override for residual gate trunk learning rate.")
+    parser.add_argument("--gate-trunk-beta2", type=float, default=None, help="Optional override for residual gate trunk AdamW beta2.")
+    parser.add_argument("--gate-trunk-weight-decay", type=float, default=None, help="Optional override for residual gate trunk weight decay.")
+    parser.add_argument("--gate-bias-lr", type=float, default=None, help="Optional override for residual gate bias learning rate.")
+    parser.add_argument("--gate-bias-beta2", type=float, default=None, help="Optional override for residual gate bias AdamW beta2.")
+    parser.add_argument("--gate-bias-weight-decay", type=float, default=None, help="Optional override for residual gate bias weight decay.")
     parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--muon-lr", type=float, default=0.02)
     parser.add_argument("--muon-weight-decay", type=float, default=0.01)
@@ -107,6 +122,56 @@ def get_lr_scale(step: int, *, train_steps: int, warmup_frac: float, cooldown_fr
     return 1.0
 
 
+def resolve_gate_schedule_args(args: argparse.Namespace) -> tuple[float, float]:
+    gate_warmup_frac = args.warmup_frac if args.gate_warmup_frac is None else args.gate_warmup_frac
+    gate_cooldown_frac = args.cooldown_frac if args.gate_cooldown_frac is None else args.gate_cooldown_frac
+    return gate_warmup_frac, gate_cooldown_frac
+
+
+def get_gate_lr_scale(
+    step: int,
+    *,
+    train_steps: int,
+    warmup_frac: float,
+    cooldown_frac: float,
+    freeze_steps: int,
+) -> float:
+    if freeze_steps < 0:
+        raise ValueError("freeze_steps must be non-negative")
+    if freeze_steps >= train_steps:
+        raise ValueError("freeze_steps must be less than train_steps")
+    active_steps = train_steps - freeze_steps
+    if not 0 <= step < train_steps:
+        raise ValueError("step must be in [0, train_steps)")
+    if step >= active_steps:
+        return 0.0
+    return get_lr_scale(
+        step,
+        train_steps=active_steps,
+        warmup_frac=warmup_frac,
+        cooldown_frac=cooldown_frac,
+    )
+
+
+def apply_lr_scales(
+    optimizers: list,
+    *,
+    base_lr_scale: float,
+    gate_lr_scale: float | None = None,
+) -> dict[str, float]:
+    current_lrs: dict[str, float] = {}
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group_name = group.get("group_name")
+            lr_scale = base_lr_scale
+            if gate_lr_scale is not None and group_name in {"gate_trunk", "gate_head", "gate_bias"}:
+                lr_scale = gate_lr_scale
+            group["lr"] = group["initial_lr"] * lr_scale
+            if group_name is not None:
+                current_lrs[group_name] = group["lr"]
+    return current_lrs
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.model_dim % args.head_dim != 0:
         raise ValueError("--head-dim must divide --model-dim")
@@ -135,6 +200,41 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--stability-sample-sequences must be positive")
     if args.matrix_log_interval <= 0:
         raise ValueError("--matrix-log-interval must be positive")
+    if args.gate_lr <= 0:
+        raise ValueError("--gate-lr must be positive")
+    if not 0 < args.gate_beta2 < 1:
+        raise ValueError("--gate-beta2 must be in (0, 1)")
+    if args.gate_weight_decay < 0:
+        raise ValueError("--gate-weight-decay must be non-negative")
+    if args.gate_trunk_lr is not None and args.gate_trunk_lr <= 0:
+        raise ValueError("--gate-trunk-lr must be positive when set")
+    if args.gate_trunk_beta2 is not None and not 0 < args.gate_trunk_beta2 < 1:
+        raise ValueError("--gate-trunk-beta2 must be in (0, 1) when set")
+    if args.gate_trunk_weight_decay is not None and args.gate_trunk_weight_decay < 0:
+        raise ValueError("--gate-trunk-weight-decay must be non-negative when set")
+    if args.gate_bias_lr is not None and args.gate_bias_lr <= 0:
+        raise ValueError("--gate-bias-lr must be positive when set")
+    if args.gate_bias_beta2 is not None and not 0 < args.gate_bias_beta2 < 1:
+        raise ValueError("--gate-bias-beta2 must be in (0, 1) when set")
+    if args.gate_bias_weight_decay is not None and args.gate_bias_weight_decay < 0:
+        raise ValueError("--gate-bias-weight-decay must be non-negative when set")
+    if args.gate_freeze_steps < 0:
+        raise ValueError("--gate-freeze-steps must be non-negative")
+    if args.gate_freeze_steps >= args.train_steps:
+        raise ValueError("--gate-freeze-steps must be less than --train-steps")
+    gate_warmup_frac, gate_cooldown_frac = resolve_gate_schedule_args(args)
+    validate_schedule(
+        train_steps=args.train_steps - args.gate_freeze_steps,
+        warmup_frac=gate_warmup_frac,
+        cooldown_frac=gate_cooldown_frac,
+    )
+    if not 0 < args.gate_delta_scale <= 1:
+        raise ValueError("--gate-delta-scale must be in (0, 1]")
+    if args.learned_residual_gates:
+        if args.gate_feature_dim <= 0:
+            raise ValueError("--gate-feature-dim must be positive")
+        if args.gate_feature_dim > args.model_dim:
+            raise ValueError("--gate-feature-dim must not exceed --model-dim")
 
 
 def setup_distributed() -> torch.device:
@@ -235,6 +335,9 @@ def build_model(args: argparse.Namespace) -> GPT:
         rope_base=args.rope_base,
         attention_scale=args.attention_scale,
         logit_softcap=args.logit_softcap,
+        learned_residual_gates=args.learned_residual_gates,
+        gate_feature_dim=args.gate_feature_dim,
+        gate_delta_scale=args.gate_delta_scale,
     )
     model = GPT(config).cuda()
     if args.compile:
@@ -306,6 +409,15 @@ def run_training(args: argparse.Namespace) -> None:
         adam_beta2=args.adam_beta2,
         adam_eps=args.adam_eps,
         adam_weight_decay=args.adam_weight_decay,
+        gate_lr=args.gate_lr,
+        gate_beta2=args.gate_beta2,
+        gate_weight_decay=args.gate_weight_decay,
+        gate_trunk_lr=args.gate_trunk_lr,
+        gate_trunk_beta2=args.gate_trunk_beta2,
+        gate_trunk_weight_decay=args.gate_trunk_weight_decay,
+        gate_bias_lr=args.gate_bias_lr,
+        gate_bias_beta2=args.gate_bias_beta2,
+        gate_bias_weight_decay=args.gate_bias_weight_decay,
         muon_lr=args.muon_lr,
         muon_weight_decay=args.muon_weight_decay,
         muon_momentum=args.muon_momentum,
@@ -320,6 +432,7 @@ def run_training(args: argparse.Namespace) -> None:
         world_size=world_size,
         device=device,
     )
+    gate_warmup_frac, gate_cooldown_frac = resolve_gate_schedule_args(args)
     training_time = 0.0
 
     dist.barrier()
@@ -398,9 +511,20 @@ def run_training(args: argparse.Namespace) -> None:
                 warmup_frac=args.warmup_frac,
                 cooldown_frac=args.cooldown_frac,
             )
-            for optimizer in optimizers:
-                for group in optimizer.param_groups:
-                    group["lr"] = group["initial_lr"] * lr_scale
+            gate_lr_scale = None
+            if args.learned_residual_gates:
+                gate_lr_scale = get_gate_lr_scale(
+                    step,
+                    train_steps=args.train_steps,
+                    warmup_frac=gate_warmup_frac,
+                    cooldown_frac=gate_cooldown_frac,
+                    freeze_steps=args.gate_freeze_steps,
+                )
+            current_lrs = apply_lr_scales(
+                optimizers,
+                base_lr_scale=lr_scale,
+                gate_lr_scale=gate_lr_scale,
+            )
 
             if collect_any_metrics:
                 metrics_payload.update(
@@ -408,13 +532,19 @@ def run_training(args: argparse.Namespace) -> None:
                         "step": current_step,
                         "tokens_seen": current_step * args.batch_size,
                         "main/train_loss": train_loss_value,
-                        "main/lr_adam_head": optimizers[0].param_groups[0]["lr"],
-                        "main/lr_adam_embed": optimizers[0].param_groups[1]["lr"],
-                        "main/lr_muon": optimizers[1].param_groups[0]["lr"],
+                        "main/lr_adam_head": current_lrs["adam_head"],
+                        "main/lr_adam_embed": current_lrs["adam_embed"],
+                        "main/lr_muon": current_lrs["muon_hidden_matrix"],
                         "main/norm_instrumentation_active": float(collect_norm_diagnostics),
                         "main/stability_replay_active": float(collect_stability_diagnostics),
                     }
                 )
+                if "gate_trunk" in current_lrs:
+                    metrics_payload["main/lr_gate_trunk"] = current_lrs["gate_trunk"]
+                if "gate_head" in current_lrs:
+                    metrics_payload["main/lr_gate_head"] = current_lrs["gate_head"]
+                if "gate_bias" in current_lrs:
+                    metrics_payload["main/lr_gate_bias"] = current_lrs["gate_bias"]
                 if collect_norm_diagnostics:
                     if rank == 0:
                         norm_metrics_start = time.perf_counter()
