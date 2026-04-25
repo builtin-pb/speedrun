@@ -36,10 +36,24 @@ def muon_update(grad: Tensor, momentum: Tensor, beta: float = 0.95, nesterov: bo
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params: list[nn.Parameter], lr: float = 0.02, weight_decay: float = 0.0, momentum: float = 0.95):
+    def __init__(self, params: list[nn.Parameter] | list[dict], lr: float = 0.02, weight_decay: float = 0.0, momentum: float = 0.95):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        assert params and isinstance(params[0], nn.Parameter)
-        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        if not params:
+            raise ValueError("Muon requires at least one parameter")
+        if isinstance(params[0], dict):
+            normalized_param_groups = []
+            for group in params:
+                group_params = list(group["params"])
+                if not group_params:
+                    continue
+                normalized_group = dict(group)
+                normalized_group["params"] = sorted(group_params, key=lambda x: x.size(), reverse=True)
+                normalized_param_groups.append(normalized_group)
+            if not normalized_param_groups:
+                raise ValueError("Muon requires at least one parameter")
+            params = normalized_param_groups
+        else:
+            params = sorted(params, key=lambda x: x.size(), reverse=True)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -73,9 +87,15 @@ def build_optimizers(
     muon_lr: float = 0.02,
     muon_weight_decay: float = 0.01,
     muon_momentum: float = 0.95,
+    muon_residual_lr_scale: float = 1.0,
+    muon_residual_momentum: float | None = None,
     fused_adamw: bool = True,
 ) -> list[torch.optim.Optimizer]:
-    hidden_matrix_params = [param for param in model.blocks.parameters() if param.ndim >= 2]
+    residual_matrix_params: list[nn.Parameter] = []
+    hidden_matrix_params: list[nn.Parameter] = []
+    for block in model.blocks:
+        residual_matrix_params.extend([block.attn.proj.weight, block.mlp.proj.weight])
+        hidden_matrix_params.extend([block.attn.q.weight, block.attn.k.weight, block.attn.v.weight, block.mlp.fc.weight])
     embed_params = list(model.embed.parameters())
     head_params = [model.proj.weight]
 
@@ -91,7 +111,17 @@ def build_optimizers(
     if fused_adamw:
         adamw_kwargs["fused"] = True
     optimizer1 = torch.optim.AdamW(adam_param_groups, **adamw_kwargs)
-    optimizer2 = Muon(hidden_matrix_params, lr=muon_lr, weight_decay=muon_weight_decay, momentum=muon_momentum)
+    muon_param_groups = [
+        dict(params=hidden_matrix_params, lr=muon_lr, weight_decay=muon_weight_decay, momentum=muon_momentum, name="muon_main"),
+        dict(
+            params=residual_matrix_params,
+            lr=muon_lr * muon_residual_lr_scale,
+            weight_decay=muon_weight_decay,
+            momentum=muon_momentum if muon_residual_momentum is None else muon_residual_momentum,
+            name="muon_residual",
+        ),
+    ]
+    optimizer2 = Muon(muon_param_groups, lr=muon_lr, weight_decay=muon_weight_decay, momentum=muon_momentum)
     optimizers = [optimizer1, optimizer2]
     for optimizer in optimizers:
         for group in optimizer.param_groups:

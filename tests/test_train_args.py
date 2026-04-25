@@ -101,3 +101,53 @@ class TrainArgsTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "--mlp-proj-init-scale"):
             validate_args(args)
+
+    def test_muon_schedule_knobs_accept_override_and_floor(self) -> None:
+        args = build_parser().parse_args(["--muon-cooldown-frac", "0.3", "--muon-lr-floor-scale", "0.2"])
+
+        self.assertEqual(args.muon_cooldown_frac, 0.3)
+        self.assertEqual(args.muon_lr_floor_scale, 0.2)
+        validate_args(args)
+
+    def test_muon_residual_knobs_accept_valid_values(self) -> None:
+        args = build_parser().parse_args(["--muon-residual-lr-scale", "0.7", "--muon-residual-momentum", "0.8"])
+
+        self.assertEqual(args.muon_residual_lr_scale, 0.7)
+        self.assertEqual(args.muon_residual_momentum, 0.8)
+        validate_args(args)
+
+    def test_muon_schedule_knobs_reject_invalid_floor(self) -> None:
+        args = build_parser().parse_args(["--muon-lr-floor-scale", "1.1"])
+
+        with self.assertRaisesRegex(ValueError, "--muon-lr-floor-scale"):
+            validate_args(args)
+
+    def test_muon_residual_knobs_reject_invalid_values(self) -> None:
+        args = build_parser().parse_args(["--muon-residual-lr-scale", "0.0"])
+
+        with self.assertRaisesRegex(ValueError, "--muon-residual-lr-scale"):
+            validate_args(args)
+
+        args = build_parser().parse_args(["--muon-residual-momentum", "1.0"])
+
+        with self.assertRaisesRegex(ValueError, "--muon-residual-momentum"):
+            validate_args(args)
+
+    def test_muon_schedule_knobs_reject_overlapping_muon_schedule(self) -> None:
+        args = build_parser().parse_args(["--warmup-frac", "0.8", "--cooldown-frac", "0.1", "--muon-cooldown-frac", "0.3"])
+
+        with self.assertRaisesRegex(ValueError, "must not exceed 1"):
+            validate_args(args)
+
+    def test_muon_schedule_knobs_accept_absolute_decay_override(self) -> None:
+        args = build_parser().parse_args(["--muon-decay-start-step", "100", "--muon-decay-steps", "50"])
+
+        self.assertEqual(args.muon_decay_start_step, 100)
+        self.assertEqual(args.muon_decay_steps, 50)
+        validate_args(args)
+
+    def test_muon_schedule_knobs_reject_partial_absolute_decay_override(self) -> None:
+        args = build_parser().parse_args(["--muon-decay-start-step", "100"])
+
+        with self.assertRaisesRegex(ValueError, "provided together"):
+            validate_args(args)

@@ -78,6 +78,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muon-lr", type=float, default=0.02)
     parser.add_argument("--muon-weight-decay", type=float, default=0.01)
     parser.add_argument("--muon-momentum", type=float, default=0.95)
+    parser.add_argument(
+        "--muon-residual-lr-scale",
+        type=float,
+        default=1.0,
+        help="LR multiplier applied only to Muon residual projection matrices.",
+    )
+    parser.add_argument(
+        "--muon-residual-momentum",
+        type=float,
+        default=None,
+        help="Optional Muon momentum override for residual projection matrices.",
+    )
+    parser.add_argument(
+        "--muon-cooldown-frac",
+        type=float,
+        default=None,
+        help="Override the Muon cooldown fraction while leaving Adam on --cooldown-frac.",
+    )
+    parser.add_argument(
+        "--muon-lr-floor-scale",
+        type=float,
+        default=0.0,
+        help="Minimum Muon LR as a fraction of --muon-lr during cooldown.",
+    )
+    parser.add_argument(
+        "--muon-decay-start-step",
+        type=int,
+        default=None,
+        help="Optional absolute step where the Muon LR starts decaying toward its floor.",
+    )
+    parser.add_argument(
+        "--muon-decay-steps",
+        type=int,
+        default=None,
+        help="Number of steps used by the optional Muon LR decay override.",
+    )
     return parser
 
 
@@ -107,18 +143,45 @@ def resolve_schedule(*, train_steps: int, warmup_frac: float, cooldown_frac: flo
     return warmup_steps, cooldown_steps
 
 
-def get_lr_scale(step: int, *, train_steps: int, warmup_frac: float, cooldown_frac: float) -> float:
-    warmup_steps, cooldown_steps = resolve_schedule(
+def get_lr_scale(
+    step: int,
+    *,
+    train_steps: int,
+    warmup_frac: float,
+    cooldown_frac: float,
+    cooldown_floor_scale: float = 0.0,
+    cooldown_start_step: int | None = None,
+    cooldown_steps: int | None = None,
+) -> float:
+    warmup_steps, scheduled_cooldown_steps = resolve_schedule(
         train_steps=train_steps,
         warmup_frac=warmup_frac,
         cooldown_frac=cooldown_frac,
     )
     if not 0 <= step < train_steps:
         raise ValueError("step must be in [0, train_steps)")
+    if not 0.0 <= cooldown_floor_scale <= 1.0:
+        raise ValueError("cooldown_floor_scale must be in [0, 1]")
+    if (cooldown_start_step is None) != (cooldown_steps is None):
+        raise ValueError("cooldown_start_step and cooldown_steps must be provided together")
     if warmup_steps and step < warmup_steps:
         return (step + 1) / warmup_steps
-    if cooldown_steps and step >= train_steps - cooldown_steps:
-        return (train_steps - step) / cooldown_steps
+    if cooldown_start_step is not None:
+        if not 0 <= cooldown_start_step < train_steps:
+            raise ValueError("cooldown_start_step must be in [0, train_steps)")
+        if cooldown_steps <= 0:
+            raise ValueError("cooldown_steps must be positive")
+        if cooldown_start_step < warmup_steps:
+            raise ValueError("cooldown_start_step must be after warmup")
+        if step < cooldown_start_step:
+            return 1.0
+        if step >= cooldown_start_step + cooldown_steps:
+            return cooldown_floor_scale
+        base_scale = (cooldown_steps - (step - cooldown_start_step)) / cooldown_steps
+        return cooldown_floor_scale + (1.0 - cooldown_floor_scale) * base_scale
+    if scheduled_cooldown_steps and step >= train_steps - scheduled_cooldown_steps:
+        base_scale = (train_steps - step) / scheduled_cooldown_steps
+        return cooldown_floor_scale + (1.0 - cooldown_floor_scale) * base_scale
     return 1.0
 
 
@@ -142,6 +205,30 @@ def validate_args(args: argparse.Namespace) -> None:
         warmup_frac=args.warmup_frac,
         cooldown_frac=args.cooldown_frac,
     )
+    muon_cooldown_frac = args.cooldown_frac if args.muon_cooldown_frac is None else args.muon_cooldown_frac
+    validate_schedule(
+        train_steps=args.train_steps,
+        warmup_frac=args.warmup_frac,
+        cooldown_frac=muon_cooldown_frac,
+    )
+    if (args.muon_decay_start_step is None) != (args.muon_decay_steps is None):
+        raise ValueError("--muon-decay-start-step and --muon-decay-steps must be provided together")
+    if args.muon_decay_start_step is not None:
+        if not 0 <= args.muon_decay_start_step < args.train_steps:
+            raise ValueError("--muon-decay-start-step must be in [0, --train-steps)")
+        if args.muon_decay_steps <= 0:
+            raise ValueError("--muon-decay-steps must be positive")
+        warmup_steps, _ = resolve_schedule(
+            train_steps=args.train_steps,
+            warmup_frac=args.warmup_frac,
+            cooldown_frac=args.cooldown_frac,
+        )
+        if args.muon_decay_start_step < warmup_steps:
+            raise ValueError("--muon-decay-start-step must be after warmup")
+    if args.muon_residual_lr_scale <= 0:
+        raise ValueError("--muon-residual-lr-scale must be positive")
+    if args.muon_residual_momentum is not None and not 0.0 <= args.muon_residual_momentum < 1.0:
+        raise ValueError("--muon-residual-momentum must be in [0, 1)")
     if args.wandb_log_interval <= 0:
         raise ValueError("--wandb-log-interval must be positive")
     if args.stability_log_interval <= 0:
@@ -150,6 +237,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--stability-sample-sequences must be positive")
     if args.matrix_log_interval <= 0:
         raise ValueError("--matrix-log-interval must be positive")
+    if not 0.0 <= args.muon_lr_floor_scale <= 1.0:
+        raise ValueError("--muon-lr-floor-scale must be in [0, 1]")
     for arg_name in (
         "embed_init_scale",
         "lm_head_init_scale",
@@ -352,6 +441,8 @@ def run_training(args: argparse.Namespace) -> None:
         muon_lr=args.muon_lr,
         muon_weight_decay=args.muon_weight_decay,
         muon_momentum=args.muon_momentum,
+        muon_residual_lr_scale=args.muon_residual_lr_scale,
+        muon_residual_momentum=args.muon_residual_momentum,
         fused_adamw=args.fused_adamw,
     )
 
@@ -435,15 +526,26 @@ def run_training(args: argparse.Namespace) -> None:
 
             train_loss_value = tensor_scalar(train_loss / args.batch_size)
             metrics_payload: dict[str, float] = {}
-            lr_scale = get_lr_scale(
+            adam_lr_scale = get_lr_scale(
                 step,
                 train_steps=args.train_steps,
                 warmup_frac=args.warmup_frac,
                 cooldown_frac=args.cooldown_frac,
             )
-            for optimizer in optimizers:
-                for group in optimizer.param_groups:
-                    group["lr"] = group["initial_lr"] * lr_scale
+            muon_cooldown_frac = args.cooldown_frac if args.muon_cooldown_frac is None else args.muon_cooldown_frac
+            muon_lr_scale = get_lr_scale(
+                step,
+                train_steps=args.train_steps,
+                warmup_frac=args.warmup_frac,
+                cooldown_frac=muon_cooldown_frac,
+                cooldown_floor_scale=args.muon_lr_floor_scale,
+                cooldown_start_step=args.muon_decay_start_step,
+                cooldown_steps=args.muon_decay_steps,
+            )
+            for group in optimizers[0].param_groups:
+                group["lr"] = group["initial_lr"] * adam_lr_scale
+            for group in optimizers[1].param_groups:
+                group["lr"] = group["initial_lr"] * muon_lr_scale
 
             if collect_any_metrics:
                 metrics_payload.update(
@@ -454,6 +556,8 @@ def run_training(args: argparse.Namespace) -> None:
                         "main/lr_adam_head": optimizers[0].param_groups[0]["lr"],
                         "main/lr_adam_embed": optimizers[0].param_groups[1]["lr"],
                         "main/lr_muon": optimizers[1].param_groups[0]["lr"],
+                        "main/lr_muon_residual": optimizers[1].param_groups[1]["lr"],
+                        "main/lr_muon_scale": muon_lr_scale,
                         "main/norm_instrumentation_active": float(collect_norm_diagnostics),
                         "main/stability_replay_active": float(collect_stability_diagnostics),
                     }
