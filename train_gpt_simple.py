@@ -51,10 +51,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rope-base", type=float, default=1024.0)
     parser.add_argument("--attention-scale", type=float, default=0.12)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
+    parser.add_argument(
+        "--attention-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Kimi-style source-history attention residuals; --no-attention-residual restores standard additive residuals.",
+    )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--adam-head-lr", type=float, default=1 / 320)
     parser.add_argument("--adam-embed-lr", type=float, default=0.3)
+    parser.add_argument(
+        "--adam-attnres-lr",
+        type=float,
+        default=0.02,
+        help="AdamW LR for attention-residual depth-query vectors; active only when --attention-residual is enabled.",
+    )
     parser.add_argument("--adam-beta1", type=float, default=0.8)
     parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--adam-eps", type=float, default=1e-10)
@@ -235,6 +247,7 @@ def build_model(args: argparse.Namespace) -> GPT:
         rope_base=args.rope_base,
         attention_scale=args.attention_scale,
         logit_softcap=args.logit_softcap,
+        attention_residual=args.attention_residual,
     )
     model = GPT(config).cuda()
     if args.compile:
@@ -266,6 +279,30 @@ def run_validation(
             val_loss += model(inputs[offset:offset + micro_batch_size], targets[offset:offset + micro_batch_size])
     dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
     return val_loss / val_tokens
+
+
+def all_reduce_model_gradients(model: GPT) -> None:
+    import torch
+    import torch.distributed as dist
+
+    small_grads: list[torch.Tensor] = []
+    for name, param in model.named_parameters():
+        assert param.grad is not None, name
+        if param.grad.ndim <= 1:
+            small_grads.append(param.grad)
+        else:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+
+    if not small_grads:
+        return
+
+    flat_grad = torch.cat([grad.reshape(-1) for grad in small_grads])
+    dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
+    offset = 0
+    for grad in small_grads:
+        grad_size = grad.numel()
+        grad.copy_(flat_grad[offset:offset + grad_size].view_as(grad))
+        offset += grad_size
 
 
 def run_training(args: argparse.Namespace) -> None:
@@ -302,6 +339,7 @@ def run_training(args: argparse.Namespace) -> None:
         model,
         adam_head_lr=args.adam_head_lr,
         adam_embed_lr=args.adam_embed_lr,
+        adam_attnres_lr=args.adam_attnres_lr,
         adam_beta1=args.adam_beta1,
         adam_beta2=args.adam_beta2,
         adam_eps=args.adam_eps,
@@ -386,9 +424,7 @@ def run_training(args: argparse.Namespace) -> None:
                 micro_loss.backward()
 
             dist.all_reduce(train_loss, op=dist.ReduceOp.SUM)
-            for name, param in model.named_parameters():
-                assert param.grad is not None, name
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            all_reduce_model_gradients(model)
 
             train_loss_value = tensor_scalar(train_loss / args.batch_size)
             metrics_payload: dict[str, float] = {}
@@ -410,6 +446,7 @@ def run_training(args: argparse.Namespace) -> None:
                         "main/train_loss": train_loss_value,
                         "main/lr_adam_head": optimizers[0].param_groups[0]["lr"],
                         "main/lr_adam_embed": optimizers[0].param_groups[1]["lr"],
+                        "main/lr_adam_attnres": optimizers[0].param_groups[2]["lr"] if len(optimizers[0].param_groups) > 2 else 0.0,
                         "main/lr_muon": optimizers[1].param_groups[0]["lr"],
                         "main/norm_instrumentation_active": float(collect_norm_diagnostics),
                         "main/stability_replay_active": float(collect_stability_diagnostics),

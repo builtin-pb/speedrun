@@ -66,6 +66,7 @@ def build_optimizers(
     *,
     adam_head_lr: float = 1 / 320,
     adam_embed_lr: float = 0.3,
+    adam_attnres_lr: float = 0.02,
     adam_beta1: float = 0.8,
     adam_beta2: float = 0.95,
     adam_eps: float = 1e-10,
@@ -75,6 +76,12 @@ def build_optimizers(
     muon_momentum: float = 0.95,
     fused_adamw: bool = True,
 ) -> list[torch.optim.Optimizer]:
+    attnres_query_params = [
+        param
+        for name, param in model.named_parameters()
+        if name.endswith(("attn_res.query.weight", "mlp_res.query.weight"))
+        or name == "final_res.query.weight"
+    ]
     hidden_matrix_params = [param for param in model.blocks.parameters() if param.ndim >= 2]
     embed_params = list(model.embed.parameters())
     head_params = [model.proj.weight]
@@ -83,6 +90,8 @@ def build_optimizers(
         dict(params=head_params, lr=adam_head_lr),
         dict(params=embed_params, lr=adam_embed_lr),
     ]
+    if attnres_query_params:
+        adam_param_groups.append(dict(params=attnres_query_params, lr=adam_attnres_lr))
     adamw_kwargs = dict(
         betas=(adam_beta1, adam_beta2),
         eps=adam_eps,

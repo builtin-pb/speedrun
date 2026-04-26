@@ -50,10 +50,14 @@ def setup_wandb(args, print0, *, rank: int):
         "layer_attn",
         "layer_mlp",
         "layer_final",
+        "attnres_attn",
+        "attnres_mlp",
+        "attnres_final",
         "matrix_attn_q",
         "matrix_attn_k",
         "matrix_attn_v",
         "matrix_attn_proj",
+        "matrix_attnres_query",
         "matrix_mlp_fc",
         "matrix_mlp_proj",
         "matrix_embed",
@@ -90,9 +94,14 @@ def parameter_metric_name(name: str, kind: str) -> str:
         return f"matrix_embed/{kind}"
     if name == "proj.weight":
         return f"matrix_lm_head/{kind}"
+    if name == "final_res.query.weight":
+        return f"matrix_attnres_query/final_{kind}"
     parts = name.split(".")
     if len(parts) >= 4 and parts[0] == "blocks":
         block_label = f"block_{int(parts[1]):02d}"
+        if parts[2] in ("attn_res", "mlp_res") and parts[3] == "query":
+            sublayer = "attn" if parts[2] == "attn_res" else "mlp"
+            return f"matrix_attnres_query/{block_label}_{sublayer}_{kind}"
         if parts[2] == "attn":
             mapping = {"q": "matrix_attn_q", "k": "matrix_attn_k", "v": "matrix_attn_v", "proj": "matrix_attn_proj"}
             metric_group = mapping.get(parts[3], "matrix_other")

@@ -17,6 +17,7 @@ class GPTConfig:
     rope_base: float = 1024.0
     attention_scale: float = 0.12
     logit_softcap: float = 15.0
+    attention_residual: bool = False
 
 
 def norm(x: Tensor) -> Tensor:
@@ -153,9 +154,54 @@ class MLP(nn.Module):
         return x
 
 
-class Block(nn.Module):
-    def __init__(self, config: GPTConfig):
+class DepthQuery(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+
+class FullAttentionResidual(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query = DepthQuery(dim)
+
+    def forward(
+        self,
+        history: list[Tensor],
+        observer: Callable[[str, Tensor], None] | None = None,
+        metric_prefix: str | None = None,
+    ) -> Tensor:
+        if not history:
+            raise ValueError("attention residual history must contain at least one state")
+
+        query = self.query.weight
+        logits = torch.stack(
+            [(norm(state) * query.to(dtype=state.dtype)).sum(dim=-1).float() for state in history],
+            dim=0,
+        )
+        weights = logits.softmax(dim=0)
+
+        mixed = torch.zeros_like(history[-1])
+        for weight, state in zip(weights.unbind(dim=0), history):
+            mixed.addcmul_(weight.to(dtype=state.dtype).unsqueeze(-1), state)
+
+        if observer is not None:
+            assert metric_prefix is not None
+            entropy = -(weights * weights.clamp_min(1e-8).log()).sum(dim=0)
+            observer(f"{metric_prefix}_weight_entropy_rms", entropy)
+            observer(f"{metric_prefix}_weight_max_rms", weights.amax(dim=0))
+            observer(f"{metric_prefix}_current_weight_rms", weights[-1])
+            observer(f"{metric_prefix}_embedding_weight_rms", weights[0])
+            zero = weights[0].new_zeros(weights[0].shape)
+            observer(f"{metric_prefix}_attn_source_weight_rms", weights[1::2].sum(dim=0) if len(history) > 1 else zero)
+            observer(f"{metric_prefix}_mlp_source_weight_rms", weights[2::2].sum(dim=0) if len(history) > 2 else zero)
+        return mixed
+
+
+class Block(nn.Module):
+    def __init__(self, config: GPTConfig, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
         proj_init_scale = residual_proj_init_scale(num_layers=config.num_layers)
         self.attn = CausalSelfAttention(
             config.model_dim,
@@ -169,8 +215,17 @@ class Block(nn.Module):
             expansion=config.mlp_expansion,
             proj_init_scale=proj_init_scale,
         )
+        self.attention_residual = config.attention_residual
+        if self.attention_residual:
+            self.attn_res = None if layer_idx == 0 else FullAttentionResidual(config.model_dim)
+            self.mlp_res = FullAttentionResidual(config.model_dim)
 
-    def forward(self, x: Tensor, observer: Callable[[str, Tensor], None] | None = None, block_idx: int | None = None) -> Tensor:
+    def _forward_standard(
+        self,
+        x: Tensor,
+        observer: Callable[[str, Tensor], None] | None = None,
+        block_idx: int | None = None,
+    ) -> Tensor:
         if observer is not None:
             assert block_idx is not None
             observer(f"layer_attn/block_{block_idx:02d}_input_rms", x)
@@ -189,6 +244,66 @@ class Block(nn.Module):
             observer(f"layer_mlp/block_{block_idx:02d}_output_rms", x)
         return x
 
+    def _forward_attention_residual(
+        self,
+        x: Tensor,
+        history: list[Tensor],
+        observer: Callable[[str, Tensor], None] | None = None,
+        block_idx: int | None = None,
+    ) -> tuple[Tensor, list[Tensor]]:
+        assert block_idx is not None or observer is None
+        expected_history_len = 1 + 2 * self.layer_idx
+        if len(history) != expected_history_len:
+            raise ValueError(
+                f"attention residual history for block {self.layer_idx} must have length {expected_history_len}, got {len(history)}"
+            )
+        if self.attn_res is None:
+            attn_input = history[-1]
+        else:
+            attn_input = self.attn_res(
+                history,
+                observer=observer,
+                metric_prefix=f"attnres_attn/block_{block_idx:02d}" if observer is not None else None,
+            )
+        if observer is not None:
+            observer(f"layer_attn/block_{block_idx:02d}_input_rms", attn_input)
+        attn_out = self.attn(norm(attn_input), observer=observer, block_idx=block_idx)
+        if observer is not None:
+            observer(f"layer_attn/block_{block_idx:02d}_update_rms", attn_out)
+        history = history + [attn_out]
+        if observer is not None:
+            observer(f"layer_attn/block_{block_idx:02d}_output_rms", attn_input + attn_out)
+
+        mlp_input = self.mlp_res(
+            history,
+            observer=observer,
+            metric_prefix=f"attnres_mlp/block_{block_idx:02d}" if observer is not None else None,
+        )
+        if observer is not None:
+            observer(f"layer_mlp/block_{block_idx:02d}_input_rms", mlp_input)
+        mlp_out = self.mlp(norm(mlp_input), observer=observer, block_idx=block_idx)
+        if observer is not None:
+            observer(f"layer_mlp/block_{block_idx:02d}_update_rms", mlp_out)
+        history = history + [mlp_out]
+        if observer is not None:
+            observer(f"layer_mlp/block_{block_idx:02d}_output_rms", mlp_input + mlp_out)
+        return mlp_out, history
+
+    def forward(
+        self,
+        x: Tensor,
+        history: list[Tensor] | None = None,
+        observer: Callable[[str, Tensor], None] | None = None,
+        block_idx: int | None = None,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        if self.attention_residual:
+            if history is None:
+                raise ValueError("attention_residual=True requires a residual history")
+            return self._forward_attention_residual(x, history, observer=observer, block_idx=block_idx)
+        if history is not None:
+            raise ValueError("attention_residual=False does not accept a residual history")
+        return self._forward_standard(x, observer=observer, block_idx=block_idx)
+
 
 class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
@@ -196,7 +311,9 @@ class GPT(nn.Module):
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.model_dim).bfloat16()
         nn.init.normal_(self.embed.weight, mean=0.0, std=1.0)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_layers)])
+        self.blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.num_layers)])
+        if config.attention_residual:
+            self.final_res = FullAttentionResidual(config.model_dim)
         self.proj = LMHead(config.model_dim, config.vocab_size)
 
     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:
@@ -206,8 +323,23 @@ class GPT(nn.Module):
         x = norm(x)
         if observer is not None:
             observer("layer_embed/activation_rms", x)
+        history = [x] if self.config.attention_residual else None
         for block_idx, block in enumerate(self.blocks):
-            x = block(x, observer=observer, block_idx=block_idx)
+            if history is None:
+                x = block(x, observer=observer, block_idx=block_idx)
+            else:
+                x, history = block(
+                    x,
+                    history=history,
+                    observer=observer,
+                    block_idx=block_idx,
+                )
+        if history is not None:
+            x = self.final_res(
+                history,
+                observer=observer,
+                metric_prefix="attnres_final/output" if observer is not None else None,
+            )
         if observer is not None:
             observer("layer_final/residual_rms", x)
         return self.proj(norm(x)).float()

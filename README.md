@@ -76,11 +76,26 @@ The default init policy is fixed in code:
 - embedding init std `1.0`
 - LM-head init std `1 / model_dim`
 - attention and MLP residual projection init additionally scaled by `1 / sqrt(num_layers)`
+- full attention residuals are available with `--attention-residual`; their depth queries are zero-initialized, so each active residual mixer starts by uniformly averaging the available source history: the embedding plus prior attention/MLP outputs. The LM head receives a final learned source-history aggregate instead of the transient last sublayer state.
 
 Try a different model size:
 
 ```bash
 ./run_simple.sh --num-layers 8 --model-dim 512
+```
+
+Run Kimi-style source-history attention residuals:
+
+```bash
+./run_simple.sh --attention-residual
+```
+
+The residual query vectors use a separate AdamW group, tunable with `--adam-attnres-lr`.
+
+Run the standard additive-residual baseline explicitly:
+
+```bash
+./run_simple.sh --no-attention-residual
 ```
 
 Short smoke run:
@@ -142,9 +157,10 @@ There is a starter notes stub in [experiments/README.md](experiments/README.md).
 Training also logs to W&B by default. The dashboard is organized into:
 - `main/*` for high-signal run health and throughput metrics
 - `logits/*` for sampled logits and softcap diagnostics; defaults sample 1 sequence per rank and can be changed with `--stability-sample-sequences`
-- `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, and `matrix_embed/*` for matrix diagnostics, including parameter RMS, gradient RMS, and sampled activation-tail summaries
+- `matrix_attn_q/*`, `matrix_attn_k/*`, `matrix_attn_v/*`, `matrix_attn_proj/*`, `matrix_mlp_fc/*`, `matrix_mlp_proj/*`, `matrix_attnres_query/*`, and `matrix_embed/*` for parameter and matrix diagnostics, including parameter RMS, gradient RMS, and sampled activation-tail summaries where applicable
 - `matrix_lm_head/*` for LM-head parameter and gradient diagnostics
 - `layer_embed/*`, `layer_attn/*`, `layer_mlp/*`, and `layer_final/*` for sampled layer-level RMS diagnostics that are complementary to the matrix parameter/gradient metrics
+- `attnres_attn/*`, `attnres_mlp/*`, and `attnres_final/*` for sampled depth-routing weight diagnostics
 
 ### W&B Metric Reference
 
@@ -168,6 +184,7 @@ Main run metrics:
 - `main/instrumented_tokens_per_sec`
 - `main/lr_adam_head`
 - `main/lr_adam_embed`
+- `main/lr_adam_attnres`
 - `main/lr_muon`
 - `main/model_num_params`
 - `main/model_param_bytes`
@@ -203,6 +220,12 @@ Matrix metrics:
 - `matrix_embed/act_abs_p99`
 - `matrix_lm_head/param_rms`
 - `matrix_lm_head/grad_rms`
+- `matrix_attnres_query/block_XX_attn_param_rms`
+- `matrix_attnres_query/block_XX_attn_grad_rms`
+- `matrix_attnres_query/block_XX_mlp_param_rms`
+- `matrix_attnres_query/block_XX_mlp_grad_rms`
+- `matrix_attnres_query/final_param_rms`
+- `matrix_attnres_query/final_grad_rms`
 - `matrix_attn_q/block_XX_param_rms`
 - `matrix_attn_q/block_XX_grad_rms`
 - `matrix_attn_q/block_XX_act_abs_p50`
@@ -246,6 +269,28 @@ Sampled layer metrics:
 - `layer_mlp/block_XX_update_rms`
 - `layer_mlp/block_XX_output_rms`
 - `layer_final/residual_rms`
+
+Sampled attention-residual routing metrics:
+- `attnres_attn/block_XX_weight_entropy_rms`
+- `attnres_attn/block_XX_weight_max_rms`
+- `attnres_attn/block_XX_current_weight_rms`
+- `attnres_attn/block_XX_embedding_weight_rms`
+- `attnres_attn/block_XX_attn_source_weight_rms`
+- `attnres_attn/block_XX_mlp_source_weight_rms`
+- `attnres_mlp/block_XX_weight_entropy_rms`
+- `attnres_mlp/block_XX_weight_max_rms`
+- `attnres_mlp/block_XX_current_weight_rms`
+- `attnres_mlp/block_XX_embedding_weight_rms`
+- `attnres_mlp/block_XX_attn_source_weight_rms`
+- `attnres_mlp/block_XX_mlp_source_weight_rms`
+- `attnres_final/output_weight_entropy_rms`
+- `attnres_final/output_weight_max_rms`
+- `attnres_final/output_current_weight_rms`
+- `attnres_final/output_embedding_weight_rms`
+- `attnres_final/output_attn_source_weight_rms`
+- `attnres_final/output_mlp_source_weight_rms`
+
+`attnres_attn/*` and `matrix_attnres_query/block_XX_attn_*` start at `block_01` because block 0 attention has only one available residual source and therefore no learned depth query. `attnres_mlp/*` and `matrix_attnres_query/block_XX_mlp_*` start at `block_00`.
 
 ## Repo Direction
 

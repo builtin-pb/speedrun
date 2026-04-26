@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from simple_model import GPT, GPTConfig
-from train_logging import collect_norm_metrics, collect_stability_metrics
+from train_logging import collect_norm_metrics, collect_stability_metrics, parameter_metric_name
 
 
 class _TinyLoggingModel(nn.Module):
@@ -45,6 +45,20 @@ class _DummyStabilityModel:
 
 
 class TrainLoggingTests(unittest.TestCase):
+    def test_parameter_metric_name_labels_attention_residual_queries(self) -> None:
+        self.assertEqual(
+            parameter_metric_name("blocks.3.attn_res.query.weight", "param_rms"),
+            "matrix_attnres_query/block_03_attn_param_rms",
+        )
+        self.assertEqual(
+            parameter_metric_name("blocks.3.mlp_res.query.weight", "grad_rms"),
+            "matrix_attnres_query/block_03_mlp_grad_rms",
+        )
+        self.assertEqual(
+            parameter_metric_name("final_res.query.weight", "param_rms"),
+            "matrix_attnres_query/final_param_rms",
+        )
+
     def test_collect_norm_metrics_reports_rms_for_global_and_matrix_metrics(self) -> None:
         model = _TinyLoggingModel()
         with torch.no_grad():
@@ -60,8 +74,8 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertAlmostEqual(matrix_metrics["matrix_lm_head/param_rms"], math.sqrt(10.0 / 4.0))
         self.assertAlmostEqual(matrix_metrics["matrix_embed/grad_rms"], math.sqrt(100.0 / 4.0))
         self.assertAlmostEqual(matrix_metrics["matrix_lm_head/grad_rms"], math.sqrt(10.0 / 4.0))
-        self.assertAlmostEqual(main_metrics["main/global_param_rms"], math.sqrt(35.0 / 8.0))
-        self.assertAlmostEqual(main_metrics["main/global_grad_rms"], math.sqrt(110.0 / 8.0))
+        self.assertAlmostEqual(main_metrics["main/global_param_rms"], math.sqrt(35.0 / 8.0), delta=1e-6)
+        self.assertAlmostEqual(main_metrics["main/global_grad_rms"], math.sqrt(110.0 / 8.0), delta=1e-6)
         self.assertNotIn("main/global_param_l2", main_metrics)
         self.assertNotIn("main/global_grad_l2", main_metrics)
         self.assertNotIn("matrix_embed/param_l2", matrix_metrics)
@@ -81,7 +95,7 @@ class TrainLoggingTests(unittest.TestCase):
 
         self.assertAlmostEqual(metrics["layer_embed/activation_rms"], math.sqrt(25.0 / 8.0))
         self.assertAlmostEqual(metrics["layer_attn/block_00_update_rms"], math.sqrt(100.0 / 8.0))
-        self.assertAlmostEqual(metrics["layer_final/residual_rms"], 1.0)
+        self.assertAlmostEqual(metrics["layer_final/residual_rms"], 1.0, delta=1e-6)
         self.assertEqual(metrics["logits/top1"], 9.0)
         self.assertEqual(metrics["logits/top5_mean"], 7.0)
         self.assertEqual(metrics["logits/bottom1"], -9.0)
@@ -95,7 +109,7 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertNotIn("logits/max_abs", metrics)
 
     def test_simple_model_emits_rms_names_for_requested_observer_metrics(self) -> None:
-        model = GPT(GPTConfig(vocab_size=16, num_layers=1, model_dim=4, head_dim=4, mlp_expansion=1))
+        model = GPT(GPTConfig(vocab_size=16, num_layers=2, model_dim=4, head_dim=4, mlp_expansion=1, attention_residual=True))
         seen: list[str] = []
 
         model.compute_raw_logits(
@@ -115,6 +129,24 @@ class TrainLoggingTests(unittest.TestCase):
         self.assertIn("layer_attn/block_00_output_rms", seen)
         self.assertIn("layer_mlp/block_00_input_rms", seen)
         self.assertIn("layer_mlp/block_00_output_rms", seen)
+        self.assertIn("attnres_mlp/block_00_weight_entropy_rms", seen)
+        self.assertIn("attnres_mlp/block_00_weight_max_rms", seen)
+        self.assertIn("attnres_mlp/block_00_current_weight_rms", seen)
+        self.assertIn("attnres_mlp/block_00_embedding_weight_rms", seen)
+        self.assertIn("attnres_mlp/block_00_attn_source_weight_rms", seen)
+        self.assertIn("attnres_mlp/block_00_mlp_source_weight_rms", seen)
+        self.assertIn("attnres_attn/block_01_weight_entropy_rms", seen)
+        self.assertIn("attnres_attn/block_01_weight_max_rms", seen)
+        self.assertIn("attnres_attn/block_01_current_weight_rms", seen)
+        self.assertIn("attnres_attn/block_01_embedding_weight_rms", seen)
+        self.assertIn("attnres_attn/block_01_attn_source_weight_rms", seen)
+        self.assertIn("attnres_attn/block_01_mlp_source_weight_rms", seen)
+        self.assertIn("attnres_final/output_weight_entropy_rms", seen)
+        self.assertIn("attnres_final/output_weight_max_rms", seen)
+        self.assertIn("attnres_final/output_current_weight_rms", seen)
+        self.assertIn("attnres_final/output_embedding_weight_rms", seen)
+        self.assertIn("attnres_final/output_attn_source_weight_rms", seen)
+        self.assertIn("attnres_final/output_mlp_source_weight_rms", seen)
         self.assertIn("matrix_embed/act_abs", seen)
         self.assertIn("matrix_attn_q/block_00_act_abs", seen)
         self.assertIn("matrix_attn_k/block_00_act_abs", seen)
