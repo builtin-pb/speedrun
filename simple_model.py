@@ -18,6 +18,22 @@ class GPTConfig:
     attention_scale: float = 0.12
     logit_softcap: float = 15.0
     attention_residual: bool = False
+    attnres_logit_scale: str = "none"
+    attnres_normalize_values: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "attnres_logit_scale",
+            normalize_attnres_logit_scale(self.attnres_logit_scale),
+        )
+
+
+def normalize_attnres_logit_scale(scale: str) -> str:
+    valid_modes = {"none", "sqrt_dim", "dim"}
+    if scale not in valid_modes:
+        raise ValueError("attnres_logit_scale must be 'none', 'sqrt_dim', or 'dim'")
+    return scale
 
 
 def norm(x: Tensor) -> Tensor:
@@ -28,7 +44,9 @@ def spectral_init_std(in_features: int, out_features: int, *, scale: float = 1.0
     return scale * math.sqrt(out_features / in_features) / (math.sqrt(in_features) + math.sqrt(out_features))
 
 
-def residual_proj_init_scale(*, num_layers: int) -> float:
+def residual_proj_init_scale(*, num_layers: int, attention_residual: bool = False) -> float:
+    if attention_residual:
+        return 1.0
     return 1.0 / math.sqrt(num_layers)
 
 
@@ -161,10 +179,21 @@ class DepthQuery(nn.Module):
 
 
 class FullAttentionResidual(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, *, logit_scale_mode: str = "none", normalize_values: bool = False):
         super().__init__()
         self.query = DepthQuery(dim)
+        self.logit_scale_mode = normalize_attnres_logit_scale(logit_scale_mode)
+        self.normalize_values = normalize_values
+        if self.logit_scale_mode == "none":
+            self.logit_scale = 1.0
+        elif self.logit_scale_mode == "sqrt_dim":
+            self.logit_scale = 1.0 / math.sqrt(dim)
+        elif self.logit_scale_mode == "dim":
+            self.logit_scale = 1.0 / dim
+        else:
+            raise AssertionError(f"unhandled attnres logit scale mode: {self.logit_scale_mode}")
 
+    @torch.compiler.disable
     def forward(
         self,
         history: list[Tensor],
@@ -179,11 +208,13 @@ class FullAttentionResidual(nn.Module):
             [(norm(state) * query.to(dtype=state.dtype)).sum(dim=-1).float() for state in history],
             dim=0,
         )
+        logits = logits * self.logit_scale
         weights = logits.softmax(dim=0)
 
         mixed = torch.zeros_like(history[-1])
         for weight, state in zip(weights.unbind(dim=0), history):
-            mixed.addcmul_(weight.to(dtype=state.dtype).unsqueeze(-1), state)
+            value = norm(state) if self.normalize_values else state
+            mixed.addcmul_(weight.to(dtype=value.dtype).unsqueeze(-1), value)
 
         if observer is not None:
             assert metric_prefix is not None
@@ -202,7 +233,10 @@ class Block(nn.Module):
     def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        proj_init_scale = residual_proj_init_scale(num_layers=config.num_layers)
+        proj_init_scale = residual_proj_init_scale(
+            num_layers=config.num_layers,
+            attention_residual=config.attention_residual,
+        )
         self.attn = CausalSelfAttention(
             config.model_dim,
             head_dim=config.head_dim,
@@ -217,8 +251,20 @@ class Block(nn.Module):
         )
         self.attention_residual = config.attention_residual
         if self.attention_residual:
-            self.attn_res = None if layer_idx == 0 else FullAttentionResidual(config.model_dim)
-            self.mlp_res = FullAttentionResidual(config.model_dim)
+            self.attn_res = (
+                None
+                if layer_idx == 0
+                else FullAttentionResidual(
+                    config.model_dim,
+                    logit_scale_mode=config.attnres_logit_scale,
+                    normalize_values=config.attnres_normalize_values,
+                )
+            )
+            self.mlp_res = FullAttentionResidual(
+                config.model_dim,
+                logit_scale_mode=config.attnres_logit_scale,
+                normalize_values=config.attnres_normalize_values,
+            )
 
     def _forward_standard(
         self,
@@ -313,7 +359,11 @@ class GPT(nn.Module):
         nn.init.normal_(self.embed.weight, mean=0.0, std=1.0)
         self.blocks = nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.num_layers)])
         if config.attention_residual:
-            self.final_res = FullAttentionResidual(config.model_dim)
+            self.final_res = FullAttentionResidual(
+                config.model_dim,
+                logit_scale_mode=config.attnres_logit_scale,
+                normalize_values=config.attnres_normalize_values,
+            )
         self.proj = LMHead(config.model_dim, config.vocab_size)
 
     def compute_raw_logits(self, inputs: Tensor, observer: Callable[[str, Tensor], None] | None = None) -> Tensor:

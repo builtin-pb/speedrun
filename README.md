@@ -62,8 +62,10 @@ Run with defaults:
 Change optimizer and learning rate:
 
 ```bash
-./run_simple.sh --adam-head-lr 0.002 --adam-embed-lr 0.2
+./run_simple.sh --adam-head-lr 2.0 --adam-embed-lr 0.2
 ```
+
+`--adam-head-lr` is an LM-head LR coefficient; the resolved LR is `--adam-head-lr / model_dim`.
 
 Add linear LR warmup:
 
@@ -75,7 +77,8 @@ The default init policy is fixed in code:
 - muP-style hidden-layer spectral init
 - embedding init std `1.0`
 - LM-head init std `1 / model_dim`
-- attention and MLP residual projection init additionally scaled by `1 / sqrt(num_layers)`
+- standard additive-residual attention and MLP residual projection init additionally scaled by `1 / sqrt(num_layers)`
+- attention-residual attention and MLP projections use the unscaled hidden-matrix init, because their outputs are source-history entries rather than additive depth residual updates
 - full attention residuals are available with `--attention-residual`; their depth queries are zero-initialized, so each active residual mixer starts by uniformly averaging the available source history: the embedding plus prior attention/MLP outputs. The LM head receives a final learned source-history aggregate instead of the transient last sublayer state.
 
 Try a different model size:
@@ -90,7 +93,15 @@ Run Kimi-style source-history attention residuals:
 ./run_simple.sh --attention-residual
 ```
 
-The residual query vectors use a separate AdamW group, tunable with `--adam-attnres-lr`.
+The default attention-residual path stores each sublayer output in the source history and keeps the final learned source-history mixer before the LM head. The unscaled logit scale is explicit:
+
+```bash
+./run_simple.sh --attention-residual --attnres-logit-scale none
+```
+
+`--attnres-logit-scale none` applies no scaling to attention-residual logits. `--attnres-normalize-values` normalizes source-history values before mixing, matching the normalized keys used for depth logits.
+
+The residual query vectors use a separate AdamW group. `--adam-attnres-lr` is a scalar multiplier, and `--adam-attnres-lr-scale` chooses the base scale: `dim`, `sqrt_dim`, or `none`. The LR scale must match `--attnres-logit-scale`: `none -> dim`, `sqrt_dim -> sqrt_dim`, and `dim -> none`. The default is `--adam-attnres-lr 1.0 --adam-attnres-lr-scale dim`.
 
 Run the standard additive-residual baseline explicitly:
 
@@ -113,7 +124,7 @@ Combine architecture and optimizer changes:
 Because the arguments are normal CLI flags, you can compose them freely:
 
 ```bash
-./run_simple.sh --num-layers 6 --model-dim 384 --adam-head-lr 1e-3 --adam-weight-decay 0.1 --warmup-frac 0.05
+./run_simple.sh --num-layers 6 --model-dim 384 --adam-head-lr 1.0 --adam-weight-decay 0.1 --warmup-frac 0.05
 ```
 
 Learning-rate schedule notes:

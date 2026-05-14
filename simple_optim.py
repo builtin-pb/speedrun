@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.distributed as dist
 from torch import Tensor, nn
@@ -36,10 +38,17 @@ def muon_update(grad: Tensor, momentum: Tensor, beta: float = 0.95, nesterov: bo
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params: list[nn.Parameter], lr: float = 0.02, weight_decay: float = 0.0, momentum: float = 0.95):
+    def __init__(self, params: list[nn.Parameter] | list[dict], lr: float = 0.02, weight_decay: float = 0.0, momentum: float = 0.95):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        assert params and isinstance(params[0], nn.Parameter)
-        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        assert params
+        if isinstance(params[0], nn.Parameter):
+            params = sorted(params, key=lambda x: x.size(), reverse=True)
+        else:
+            params = [
+                {**group, "params": sorted(group["params"], key=lambda x: x.size(), reverse=True)}
+                for group in params
+                if group["params"]
+            ]
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -64,9 +73,10 @@ class Muon(torch.optim.Optimizer):
 def build_optimizers(
     model: nn.Module,
     *,
-    adam_head_lr: float = 1 / 320,
+    adam_head_lr: float = 768 / 320,
     adam_embed_lr: float = 0.3,
-    adam_attnres_lr: float = 0.02,
+    adam_attnres_lr: float = 1.0,
+    adam_attnres_lr_scale: str = "dim",
     adam_beta1: float = 0.8,
     adam_beta2: float = 0.95,
     adam_eps: float = 1e-10,
@@ -82,16 +92,43 @@ def build_optimizers(
         if name.endswith(("attn_res.query.weight", "mlp_res.query.weight"))
         or name == "final_res.query.weight"
     ]
-    hidden_matrix_params = [param for param in model.blocks.parameters() if param.ndim >= 2]
+    hidden_matrix_params: list[nn.Parameter] = []
+    mlp_proj_params: list[nn.Parameter] = []
+    for name, param in model.blocks.named_parameters():
+        if param.ndim < 2:
+            continue
+        if name.endswith("mlp.proj.weight"):
+            mlp_proj_params.append(param)
+        else:
+            hidden_matrix_params.append(param)
     embed_params = list(model.embed.parameters())
     head_params = [model.proj.weight]
 
     adam_param_groups = [
-        dict(params=head_params, lr=adam_head_lr),
+        dict(params=head_params, lr=adam_head_lr / model.config.model_dim),
         dict(params=embed_params, lr=adam_embed_lr),
     ]
     if attnres_query_params:
-        adam_param_groups.append(dict(params=attnres_query_params, lr=adam_attnres_lr))
+        expected_attnres_lr_scale = {
+            "none": "dim",
+            "sqrt_dim": "sqrt_dim",
+            "dim": "none",
+        }[model.config.attnres_logit_scale]
+        if adam_attnres_lr_scale != expected_attnres_lr_scale:
+            raise ValueError(
+                f"adam_attnres_lr_scale must match attnres_logit_scale={model.config.attnres_logit_scale!r}: "
+                f"expected {expected_attnres_lr_scale!r}"
+            )
+        dim = model.config.model_dim
+        if adam_attnres_lr_scale == "dim":
+            attnres_lr_scale = 1 / dim
+        elif adam_attnres_lr_scale == "sqrt_dim":
+            attnres_lr_scale = 1 / math.sqrt(dim)
+        elif adam_attnres_lr_scale == "none":
+            attnres_lr_scale = 1.0
+        else:
+            raise ValueError("adam_attnres_lr_scale must be 'none', 'sqrt_dim', or 'dim'")
+        adam_param_groups.append(dict(params=attnres_query_params, lr=adam_attnres_lr * attnres_lr_scale))
     adamw_kwargs = dict(
         betas=(adam_beta1, adam_beta2),
         eps=adam_eps,
@@ -100,7 +137,10 @@ def build_optimizers(
     if fused_adamw:
         adamw_kwargs["fused"] = True
     optimizer1 = torch.optim.AdamW(adam_param_groups, **adamw_kwargs)
-    optimizer2 = Muon(hidden_matrix_params, lr=muon_lr, weight_decay=muon_weight_decay, momentum=muon_momentum)
+    muon_param_groups = [dict(params=hidden_matrix_params, lr=muon_lr)]
+    if mlp_proj_params:
+        muon_param_groups.append(dict(params=mlp_proj_params, lr=muon_lr / math.sqrt(model.config.mlp_expansion)))
+    optimizer2 = Muon(muon_param_groups, lr=muon_lr, weight_decay=muon_weight_decay, momentum=muon_momentum)
     optimizers = [optimizer1, optimizer2]
     for optimizer in optimizers:
         for group in optimizer.param_groups:

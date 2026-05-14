@@ -13,5 +13,8 @@ class InitPolicyTests(unittest.TestCase):
     def test_residual_proj_init_scale_divides_by_sqrt_depth(self) -> None:
         self.assertAlmostEqual(residual_proj_init_scale(num_layers=16), 0.25)
 
+    def test_residual_proj_init_scale_is_one_with_attention_residual(self) -> None:
+        self.assertAlmostEqual(residual_proj_init_scale(num_layers=16, attention_residual=True), 1.0)
+
     def test_lm_head_init_std_matches_mup_default(self) -> None:
         self.assertAlmostEqual(lm_head_init_std(model_dim=256), 1 / 256)

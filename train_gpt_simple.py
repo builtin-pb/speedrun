@@ -57,15 +57,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Use Kimi-style source-history attention residuals; --no-attention-residual restores standard additive residuals.",
     )
+    parser.add_argument(
+        "--attnres-logit-scale",
+        choices=("none", "sqrt_dim", "dim"),
+        default="none",
+        help="Scaling applied to attention-residual depth-selection logits; none applies no scaling.",
+    )
+    parser.add_argument(
+        "--attnres-normalize-values",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Normalize attention-residual values before mixing, matching the normalized keys used for depth logits.",
+    )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
 
-    parser.add_argument("--adam-head-lr", type=float, default=1 / 320)
+    parser.add_argument(
+        "--adam-head-lr",
+        type=float,
+        default=768 / 320,
+        help="AdamW LR coefficient for the LM head; the resolved LR is this value divided by model_dim.",
+    )
     parser.add_argument("--adam-embed-lr", type=float, default=0.3)
     parser.add_argument(
         "--adam-attnres-lr",
         type=float,
-        default=0.02,
-        help="AdamW LR for attention-residual depth-query vectors; active only when --attention-residual is enabled.",
+        default=1.0,
+        help="AdamW LR scalar for attention-residual depth-query vectors; multiplied by --adam-attnres-lr-scale.",
+    )
+    parser.add_argument(
+        "--adam-attnres-lr-scale",
+        choices=("none", "sqrt_dim", "dim"),
+        default="dim",
+        help="Base scale for attention-residual depth-query LR.",
     )
     parser.add_argument("--adam-beta1", type=float, default=0.8)
     parser.add_argument("--adam-beta2", type=float, default=0.95)
@@ -120,6 +143,8 @@ def get_lr_scale(step: int, *, train_steps: int, warmup_frac: float, cooldown_fr
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    from simple_model import normalize_attnres_logit_scale
+
     if args.model_dim % args.head_dim != 0:
         raise ValueError("--head-dim must divide --model-dim")
     if args.batch_size <= 0:
@@ -147,6 +172,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--stability-sample-sequences must be positive")
     if args.matrix_log_interval <= 0:
         raise ValueError("--matrix-log-interval must be positive")
+    args.attnres_logit_scale = normalize_attnres_logit_scale(args.attnres_logit_scale)
+    if args.adam_attnres_lr <= 0:
+        raise ValueError("--adam-attnres-lr must be positive")
+    expected_attnres_lr_scale = {
+        "none": "dim",
+        "sqrt_dim": "sqrt_dim",
+        "dim": "none",
+    }[args.attnres_logit_scale]
+    if args.adam_attnres_lr_scale != expected_attnres_lr_scale:
+        raise ValueError(
+            "--adam-attnres-lr-scale must match --attnres-logit-scale "
+            f"(expected {expected_attnres_lr_scale!r} for {args.attnres_logit_scale!r})"
+        )
 
 
 def setup_distributed() -> torch.device:
@@ -248,6 +286,8 @@ def build_model(args: argparse.Namespace) -> GPT:
         attention_scale=args.attention_scale,
         logit_softcap=args.logit_softcap,
         attention_residual=args.attention_residual,
+        attnres_logit_scale=args.attnres_logit_scale,
+        attnres_normalize_values=args.attnres_normalize_values,
     )
     model = GPT(config).cuda()
     if args.compile:
@@ -340,6 +380,7 @@ def run_training(args: argparse.Namespace) -> None:
         adam_head_lr=args.adam_head_lr,
         adam_embed_lr=args.adam_embed_lr,
         adam_attnres_lr=args.adam_attnres_lr,
+        adam_attnres_lr_scale=args.adam_attnres_lr_scale,
         adam_beta1=args.adam_beta1,
         adam_beta2=args.adam_beta2,
         adam_eps=args.adam_eps,
@@ -448,6 +489,7 @@ def run_training(args: argparse.Namespace) -> None:
                         "main/lr_adam_embed": optimizers[0].param_groups[1]["lr"],
                         "main/lr_adam_attnres": optimizers[0].param_groups[2]["lr"] if len(optimizers[0].param_groups) > 2 else 0.0,
                         "main/lr_muon": optimizers[1].param_groups[0]["lr"],
+                        "main/lr_muon_mlp_proj": optimizers[1].param_groups[1]["lr"] if len(optimizers[1].param_groups) > 1 else 0.0,
                         "main/norm_instrumentation_active": float(collect_norm_diagnostics),
                         "main/stability_replay_active": float(collect_stability_diagnostics),
                     }
